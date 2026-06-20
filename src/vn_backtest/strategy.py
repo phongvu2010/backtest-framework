@@ -323,5 +323,42 @@ class Strategy:
                 f"nhưng đã trả về {type(indicator_series).__name__}."
             )
 
+        # Check for Look-Ahead Bias by running the indicator on sliced historical data
+        import numpy as np
+        import warnings
+        if len(df) > 5:
+            test_indices = [len(df) // 2, len(df) - 2]
+            for idx_test in test_indices:
+                df_sliced = df.iloc[: idx_test + 1]
+                try:
+                    # Run the indicator function on the sliced data
+                    sliced_series = func(df_sliced, *func_args, **kwargs)
+                    if isinstance(sliced_series, pd.Series) and len(sliced_series) > 0:
+                        val_sliced = sliced_series.iloc[-1]
+                        val_full = indicator_series.iloc[idx_test]
+
+                        is_bias = False
+                        if pd.isna(val_sliced) != pd.isna(val_full):
+                            is_bias = True
+                        elif pd.notna(val_sliced) and pd.notna(val_full):
+                            if not np.isclose(val_sliced, val_full, rtol=1e-5, atol=1e-8):
+                                is_bias = True
+
+                        if is_bias:
+                            func_name = getattr(func, "__name__", str(func))
+                            val_sliced_str = f"{val_sliced:.4f}" if pd.notna(val_sliced) else "NaN"
+                            val_full_str = f"{val_full:.4f}" if pd.notna(val_full) else "NaN"
+                            msg = (
+                                f"\n❌ CẢNH BÁO LOOK-AHEAD BIAS: Chỉ báo '{func_name}' trả về giá trị khác nhau "
+                                f"khi tính toán trên dữ liệu lịch sử đầy đủ so với dữ liệu bị cắt ngắn tại dòng {idx_test}.\n"
+                                f"Giá trị khi biết trước tương lai: {val_full_str}, Giá trị thực tế: {val_sliced_str}.\n"
+                                f"Vui lòng kiểm tra lại logic chỉ báo (tránh dùng shift(-1), lead indicators, v.v.) để tránh kết quả backtest ảo!"
+                            )
+                            warnings.warn(msg, UserWarning)
+                            logger.warning(f"LOOK-AHEAD BIAS DETECTED in indicator '{func_name}': Full={val_full_str}, Sliced={val_sliced_str} at index {idx_test}")
+                except Exception as e:
+                    # Catch and log any errors during sliced evaluation so it doesn't break backtest execution
+                    logger.debug(f"Không thể kiểm tra Look-Ahead Bias cho '{func.__name__ if hasattr(func, '__name__') else str(func)}': {e}")
+
         self._indicators.append(indicator_series)
         return indicator_series

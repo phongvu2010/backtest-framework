@@ -13,18 +13,21 @@ class TradingRulesManager:
         default_lot_size: int = 100,
         default_allow_odd_lot: bool = False,
         exchanges: Dict[str, str] = None,
-        raw_listing_dates: Dict[str, pd.Timestamp] = None
+        raw_listing_dates: Dict[str, pd.Timestamp] = None,
+        price_scale: float = 1.0,
     ):
         self.dynamic_rules = dynamic_rules
         self.default_lot_size = default_lot_size
         self.default_allow_odd_lot = default_allow_odd_lot
         self.exchanges = exchanges or {}
         self.raw_listing_dates = raw_listing_dates or {}
+        self.price_scale = price_scale
 
     def get_tick_size(
         self, price: float, exchange: str, current_time: pd.Timestamp = None
     ) -> float:
-        price = float(price)
+        # Convert price to VND for rule comparisons
+        price_vnd = float(price) * self.price_scale
         if exchange == "hose":
             if (
                 self.dynamic_rules
@@ -32,23 +35,25 @@ class TradingRulesManager:
                 and current_time < pd.Timestamp("2016-09-12")
             ):
                 # HOSE rules before 12/09/2016
-                if price < 50000.0:
-                    return 100.0
-                elif price < 100000.0:
-                    return 500.0
+                if price_vnd < 50000.0:
+                    tick_vnd = 100.0
+                elif price_vnd < 100000.0:
+                    tick_vnd = 500.0
                 else:
-                    return 1000.0
+                    tick_vnd = 1000.0
             else:
                 # HOSE rules from 12/09/2016 onwards
-                if price < 10000.0:
-                    return 10.0
-                elif price < 50000.0:
-                    return 50.0
+                if price_vnd < 10000.0:
+                    tick_vnd = 10.0
+                elif price_vnd < 50000.0:
+                    tick_vnd = 50.0
                 else:
-                    return 100.0
+                    tick_vnd = 100.0
         else:
             # HNX and UPCOM use 100 VND tick size for all stocks
-            return 100.0
+            tick_vnd = 100.0
+
+        return tick_vnd / self.price_scale
 
     def round_to_tick(
         self,
@@ -57,15 +62,18 @@ class TradingRulesManager:
         direction: str,
         current_time: pd.Timestamp = None,
     ) -> float:
-        price = float(price)
-        tick = self.get_tick_size(price, exchange, current_time)
+        # Convert to VND integers to avoid floating point division issues (since 1 VND is the smallest unit)
+        price_vnd = round(price * self.price_scale)
+        tick_vnd = round(self.get_tick_size(price, exchange, current_time) * self.price_scale)
 
         if direction == "down":  # Ceiling
-            return (price // tick) * tick
+            res_vnd = (price_vnd // tick_vnd) * tick_vnd
         elif direction == "up":  # Floor
-            return np.ceil(price / tick) * tick
+            res_vnd = int(np.ceil(price_vnd / tick_vnd)) * tick_vnd
         else:
-            return round(price / tick) * tick
+            res_vnd = round(price_vnd / tick_vnd) * tick_vnd
+
+        return res_vnd / self.price_scale
 
     def check_price_limits(
         self,

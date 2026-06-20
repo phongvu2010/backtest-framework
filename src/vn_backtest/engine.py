@@ -107,6 +107,8 @@ class BacktestEngine:
         market_impact_coef: float = 0.0,  # Market impact coefficient for dynamic slippage
         rights_listing_delay: int = 90,  # Calendar days delay for rights/stock dividend listing
         dividend_tax_rate: float = 0.05,  # 5% dividend tax rate in VN
+        price_scale: float = 1.0,
+        listing_dates: Dict[str, Union[str, pd.Timestamp]] = None,
     ):
         # Handle multi-ticker data dict
         if isinstance(data, pd.DataFrame):
@@ -151,6 +153,7 @@ class BacktestEngine:
         self.strategy_params = strategy_params or {}
         self.rights_listing_delay = rights_listing_delay
         self.dividend_tax_rate = dividend_tax_rate
+        self.price_scale = price_scale
         self.dividend_shares = {}
 
         # Risk management tracking
@@ -184,7 +187,6 @@ class BacktestEngine:
 
         # Initialize portfolio state
         self.cash = initial_cash
-        self.available_cash = initial_cash
 
         # Positions: ticker -> total quantity
         self.positions: Dict[str, int] = {}
@@ -227,10 +229,10 @@ class BacktestEngine:
 
         # Identify first listing dates before reindexing
         self.raw_listing_dates = {}
-        for ticker, df in self.data.items():
-            valid_df = df.dropna(subset=["Close"])
-            if not valid_df.empty:
-                self.raw_listing_dates[ticker] = valid_df.index[0]
+        input_listing_dates = listing_dates or {}
+        for ticker in self.data:
+            if ticker in input_listing_dates:
+                self.raw_listing_dates[ticker] = pd.to_datetime(input_listing_dates[ticker])
 
         # Initialize TradingRulesManager
         self.rules = TradingRulesManager(
@@ -238,11 +240,36 @@ class BacktestEngine:
             default_lot_size=self.default_lot_size,
             default_allow_odd_lot=self.default_allow_odd_lot,
             exchanges=self.exchanges,
-            raw_listing_dates=self.raw_listing_dates
+            raw_listing_dates=self.raw_listing_dates,
+            price_scale=self.price_scale,
         )
+
+        # Simple heuristic check for price scale mismatch
+        for ticker, df in self.data.items():
+            if not df.empty and "Close" in df.columns:
+                med_close = df["Close"].median()
+                if med_close < 1000.0 and self.price_scale == 1.0:
+                    import warnings
+                    warnings.warn(
+                        f"❌ CẢNH BÁO: Giá trung vị của {ticker} là {med_close:.2f} (< 1000) nhưng 'price_scale' đang đặt là 1.0.\n"
+                        f"Nếu dữ liệu của bạn có giá ở đơn vị nghìn đồng (ví dụ 50.5 thay vì 50500), vui lòng đặt 'price_scale=1000' để tránh tính sai luật trần sàn/tick size!",
+                        UserWarning
+                    )
+                    logger.warning(
+                        f"Mismatched price scale warning for {ticker}: median={med_close:.2f}, price_scale={self.price_scale}"
+                    )
 
         # Reindex and fill data to prevent multi-ticker timeline alignment issues
         self._reindex_and_fill_data()
+
+    @property
+    def available_cash(self) -> float:
+        """Get cash available to buy shares today (settled cash)."""
+        pending_cash = sum(
+            item["amount"] - item.get("borrowed", 0.0)
+            for item in self.cash_settlement_queue
+        )
+        return max(0.0, self.cash - pending_cash)
 
     def place_buy_order(
         self,
@@ -454,11 +481,7 @@ class BacktestEngine:
         """Move cash from pending to available once it reaches settlement index."""
         active_cash_settlements = []
         for item in self.cash_settlement_queue:
-            if current_idx >= item["settle_idx"]:
-                remaining_amount = item["amount"] - item.get("borrowed", 0.0)
-                if remaining_amount > 0:
-                    self.available_cash += remaining_amount
-            else:
+            if current_idx < item["settle_idx"]:
                 active_cash_settlements.append(item)
         self.cash_settlement_queue = active_cash_settlements
 
@@ -478,7 +501,6 @@ class BacktestEngine:
                 net_amount = amount - tax
 
                 self.cash += net_amount
-                self.available_cash += net_amount
 
                 # Log trade record
                 self.trades_history.append(
@@ -1101,9 +1123,8 @@ class BacktestEngine:
                                 f"Bán {qty} CP tại giá {close_price:,.0f}đ do hủy niêm yết."
                             )
 
-            # Đồng bộ hóa sức mua khả dụng tránh bị vượt quá lượng tiền mặt thực tế (trừ trường hợp dùng Margin)
-            if self.margin_ratio >= 1.0:
-                self.available_cash = max(0.0, min(self.available_cash, self.cash))
+            # Không cần đồng bộ hóa ở đây nữa vì available_cash là property động
+            pass
 
             # 2.7 Auto Stop Loss & Trailing Stop Risk checks
             self._check_risk_management(strategy, current_time, idx)
@@ -1275,7 +1296,6 @@ class BacktestEngine:
 
                 # Settle cash immediately since it's the end of backtest
                 self.cash += net_proceeds
-                self.available_cash += net_proceeds
 
                 self.positions[ticker] = 0
                 self.sellable_shares[ticker] = 0
@@ -1754,10 +1774,6 @@ class BacktestEngine:
 
                 # Deduct costs from balances
                 self.cash -= total_cost + advance_fee
-                if amount_needed > 0:
-                    self.available_cash = 0.0
-                else:
-                    self.available_cash -= total_cost
 
                 self.positions[ticker] = self.positions.get(ticker, 0) + qty
 
@@ -1992,6 +2008,7 @@ class BacktestEngine:
 
         if hasattr(self, "_current_executing_orders"):
             del self._current_executing_orders
+
     def _reindex_and_fill_data(self):
         """Reindex each ticker's DataFrame to the unified timeline and fill missing values."""
         self.last_active_dates = {}
