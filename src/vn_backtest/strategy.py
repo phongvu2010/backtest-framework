@@ -266,7 +266,9 @@ class Strategy:
             ticker, target_percent, time=self.current_time
         )
 
-    def I(self, func: Callable[..., pd.Series], *args, ticker: str = None, **kwargs) -> pd.Series:
+    def I(
+        self, func: Callable[..., pd.Series], *args, ticker: str = None, **kwargs
+    ) -> pd.Series:
         """
         Khai báo và tính toán một chỉ báo (Indicator) trên toàn bộ tập dữ liệu.
         Phương thức này tính toán theo cơ chế Vectorization (tính 1 lần ở init)
@@ -288,7 +290,13 @@ class Strategy:
             pd.Series: Chuỗi giá trị của chỉ báo.
         """
         # Xác định ticker và tham số truyền vào hàm
-        if ticker is None and args and isinstance(args[0], str) and isinstance(self.data, dict) and args[0] in self.data:
+        if (
+            ticker is None
+            and args
+            and isinstance(args[0], str)
+            and isinstance(self.data, dict)
+            and args[0] in self.data
+        ):
             ticker = args[0]
             func_args = args[1:]
         elif ticker is None:
@@ -306,20 +314,25 @@ class Strategy:
         if "Adj_Close" in df.columns and "column" not in kwargs:
             try:
                 import inspect
+
                 sig = inspect.signature(func)
                 if "column" in sig.parameters:
                     param_names = list(sig.parameters.keys())
                     col_idx = param_names.index("column") - 1  # skip first arg (df)
                     if len(func_args) <= col_idx:
                         kwargs["column"] = "Adj_Close"
-                        logger.debug("Tự động chuyển nguồn dữ liệu chỉ báo sang cột 'Adj_Close'.")
+                        logger.debug(
+                            "Tự động chuyển nguồn dữ liệu chỉ báo sang cột 'Adj_Close'."
+                        )
             except Exception:
                 if len(func_args) < 2:
                     kwargs["column"] = "Adj_Close"
         elif "Adj_Close" in df.columns and "column" in kwargs:
             if kwargs["column"] == "Close":
                 kwargs["column"] = "Adj_Close"
-                logger.debug("Tự động chuyển nguồn dữ liệu chỉ báo sang cột 'Adj_Close'.")
+                logger.debug(
+                    "Tự động chuyển nguồn dữ liệu chỉ báo sang cột 'Adj_Close'."
+                )
 
         indicator_series = func(df, *func_args, **kwargs)
 
@@ -332,6 +345,7 @@ class Strategy:
         # Check for Look-Ahead Bias by running the indicator on sliced historical data
         import numpy as np
         import warnings
+
         if len(df) > 5:
             test_indices = [len(df) // 2, len(df) - 2]
             for idx_test in test_indices:
@@ -347,13 +361,19 @@ class Strategy:
                         if pd.isna(val_sliced) != pd.isna(val_full):
                             is_bias = True
                         elif pd.notna(val_sliced) and pd.notna(val_full):
-                            if not np.isclose(val_sliced, val_full, rtol=1e-5, atol=1e-8):
+                            if not np.isclose(
+                                val_sliced, val_full, rtol=1e-5, atol=1e-8
+                            ):
                                 is_bias = True
 
                         if is_bias:
                             func_name = getattr(func, "__name__", str(func))
-                            val_sliced_str = f"{val_sliced:.4f}" if pd.notna(val_sliced) else "NaN"
-                            val_full_str = f"{val_full:.4f}" if pd.notna(val_full) else "NaN"
+                            val_sliced_str = (
+                                f"{val_sliced:.4f}" if pd.notna(val_sliced) else "NaN"
+                            )
+                            val_full_str = (
+                                f"{val_full:.4f}" if pd.notna(val_full) else "NaN"
+                            )
                             msg = (
                                 f"\n❌ CẢNH BÁO LOOK-AHEAD BIAS: Chỉ báo '{func_name}' trả về giá trị khác nhau "
                                 f"khi tính toán trên dữ liệu lịch sử đầy đủ so với dữ liệu bị cắt ngắn tại dòng {idx_test}.\n"
@@ -361,10 +381,14 @@ class Strategy:
                                 f"Vui lòng kiểm tra lại logic chỉ báo (tránh dùng shift(-1), lead indicators, v.v.) để tránh kết quả backtest ảo!"
                             )
                             warnings.warn(msg, UserWarning)
-                            logger.warning(f"LOOK-AHEAD BIAS DETECTED in indicator '{func_name}': Full={val_full_str}, Sliced={val_sliced_str} at index {idx_test}")
+                            logger.warning(
+                                f"LOOK-AHEAD BIAS DETECTED in indicator '{func_name}': Full={val_full_str}, Sliced={val_sliced_str} at index {idx_test}"
+                            )
                 except Exception as e:
                     # Catch and log any errors during sliced evaluation so it doesn't break backtest execution
-                    logger.debug(f"Không thể kiểm tra Look-Ahead Bias cho '{func.__name__ if hasattr(func, '__name__') else str(func)}': {e}")
+                    logger.debug(
+                        f"Không thể kiểm tra Look-Ahead Bias cho '{func.__name__ if hasattr(func, '__name__') else str(func)}': {e}"
+                    )
 
         self._indicators.append(indicator_series)
         return indicator_series

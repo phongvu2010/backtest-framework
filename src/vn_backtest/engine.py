@@ -30,6 +30,7 @@ class Order:
     """
     Represents a trading order in the backtest engine with a tracked lifecycle.
     """
+
     def __init__(
         self,
         order_id: str,
@@ -53,7 +54,7 @@ class Order:
         self.time_placed = time_placed
         self.oco_sibling_id = oco_sibling_id
         self.expiration_bars = expiration_bars
-        
+
         self.status = OrderStatus.PENDING
         self.quantity = 0  # To be set when sized
         self.filled_quantity = 0
@@ -234,7 +235,9 @@ class BacktestEngine:
         input_listing_dates = listing_dates or {}
         for ticker in self.data:
             if ticker in input_listing_dates:
-                self.raw_listing_dates[ticker] = pd.to_datetime(input_listing_dates[ticker])
+                self.raw_listing_dates[ticker] = pd.to_datetime(
+                    input_listing_dates[ticker]
+                )
 
         # Initialize TradingRulesManager
         self.rules = TradingRulesManager(
@@ -252,10 +255,11 @@ class BacktestEngine:
                 med_close = df["Close"].median()
                 if med_close < 1000.0 and self.price_scale == 1.0:
                     import warnings
+
                     warnings.warn(
                         f"❌ CẢNH BÁO: Giá trung vị của {ticker} là {med_close:.2f} (< 1000) nhưng 'price_scale' đang đặt là 1.0.\n"
                         f"Nếu dữ liệu của bạn có giá ở đơn vị nghìn đồng (ví dụ 50.5 thay vì 50500), vui lòng đặt 'price_scale=1000' để tránh tính sai luật trần sàn/tick size!",
-                        UserWarning
+                        UserWarning,
                     )
                     logger.warning(
                         f"Mismatched price scale warning for {ticker}: median={med_close:.2f}, price_scale={self.price_scale}"
@@ -287,7 +291,7 @@ class BacktestEngine:
         """Queue a buy order for the next bar."""
         self.order_counter += 1
         order_id = f"order_{self.order_counter}"
-        
+
         if order_type is not None:
             resolved_type = order_type.upper()
         else:
@@ -298,7 +302,7 @@ class BacktestEngine:
                 resolved_type = OrderType.STOP
             if oco_sibling_id is not None:
                 resolved_type = OrderType.OCO
-            
+
         order = Order(
             order_id=order_id,
             ticker=ticker,
@@ -328,7 +332,7 @@ class BacktestEngine:
         """Queue a sell order for the next bar."""
         self.order_counter += 1
         order_id = f"order_{self.order_counter}"
-        
+
         if order_type is not None:
             resolved_type = order_type.upper()
         else:
@@ -339,7 +343,7 @@ class BacktestEngine:
                 resolved_type = OrderType.STOP
             if oco_sibling_id is not None:
                 resolved_type = OrderType.OCO
-            
+
         order = Order(
             order_id=order_id,
             ticker=ticker,
@@ -361,7 +365,7 @@ class BacktestEngine:
         """Queue a target percent order for the next bar."""
         self.order_counter += 1
         order_id = f"order_{self.order_counter}"
-        
+
         order = Order(
             order_id=order_id,
             ticker=ticker,
@@ -382,25 +386,37 @@ class BacktestEngine:
                 target_order = order
                 found = True
                 break
-        
-        if not found and hasattr(self, "_current_executing_orders") and self._current_executing_orders:
+
+        if (
+            not found
+            and hasattr(self, "_current_executing_orders")
+            and self._current_executing_orders
+        ):
             for order in self._current_executing_orders:
                 if order.order_id == order_id:
                     target_order = order
                     found = True
                     break
-        
+
         if found and target_order is not None:
-            if target_order.status in [OrderStatus.FILLED, OrderStatus.CANCELLED, OrderStatus.EXPIRED]:
+            if target_order.status in [
+                OrderStatus.FILLED,
+                OrderStatus.CANCELLED,
+                OrderStatus.EXPIRED,
+            ]:
                 return False
-            
+
             target_order.status = OrderStatus.CANCELLED
             if target_order in self.pending_orders:
                 self.pending_orders.remove(target_order)
-            
+
             self.order_logs.append(
                 {
-                    "Date": self.dates[self.current_idx] if hasattr(self, "current_idx") else None,
+                    "Date": (
+                        self.dates[self.current_idx]
+                        if hasattr(self, "current_idx")
+                        else None
+                    ),
                     "Ticker": target_order.ticker,
                     "Action": "ORDER_CANCELLED",
                     "Reason": "Cancelled by strategy or user",
@@ -408,11 +424,11 @@ class BacktestEngine:
                     "Quantity": target_order.quantity,
                 }
             )
-            
+
             # Cascade cancel OCO sibling if exists
             if target_order.oco_sibling_id:
                 self.cancel_order(target_order.oco_sibling_id)
-                
+
             return True
         return False
 
@@ -461,7 +477,9 @@ class BacktestEngine:
         current_time: pd.Timestamp = None,
     ) -> tuple[float, float, bool, bool]:
         """Calculate ceiling and floor prices and check if execution price hits them."""
-        return self.rules.check_price_limits(price, prev_close, exchange, price_limit, current_time)
+        return self.rules.check_price_limits(
+            price, prev_close, exchange, price_limit, current_time
+        )
 
     def _get_lot_size(self, ticker: str, current_time: pd.Timestamp) -> int:
         """Get the lot size dynamically based on time and exchange rules."""
@@ -843,7 +861,9 @@ class BacktestEngine:
 
     def _apply_dynamic_rules(self, current_time: pd.Timestamp):
         """Apply VN historical trading rules based on the date."""
-        self.settlement_days = self.rules.apply_dynamic_rules(current_time, self.execution_at)
+        self.settlement_days = self.rules.apply_dynamic_rules(
+            current_time, self.execution_at
+        )
 
     def _detect_if_adjusted(self) -> bool:
         """
@@ -1017,12 +1037,20 @@ class BacktestEngine:
                 if "Average" in ticker_df.columns:
                     ref = ticker_df["Average"].where(
                         ticker_df["Average"].notna() & (ticker_df["Average"] > 0),
-                        (ticker_df["Open"] + ticker_df["High"] + ticker_df["Low"] + ticker_df["Close"]) / 4.0,
+                        (
+                            ticker_df["Open"]
+                            + ticker_df["High"]
+                            + ticker_df["Low"]
+                            + ticker_df["Close"]
+                        )
+                        / 4.0,
                     )
                 else:
                     ref = (
-                        ticker_df["Open"] + ticker_df["High"]
-                        + ticker_df["Low"] + ticker_df["Close"]
+                        ticker_df["Open"]
+                        + ticker_df["High"]
+                        + ticker_df["Low"]
+                        + ticker_df["Close"]
                     ) / 4.0
             else:
                 ref = ticker_df["Close"]
@@ -1160,7 +1188,9 @@ class BacktestEngine:
                 if current_time in ticker_df.index:
                     close_price = ticker_df.loc[current_time, "Close"]
                 else:
-                    close_val = self._prev_close_cache[ticker].get(current_time, 0.0) or 0.0
+                    close_val = (
+                        self._prev_close_cache[ticker].get(current_time, 0.0) or 0.0
+                    )
                     close_price = 0.0 if pd.isna(close_val) else float(close_val)
                 positions_value += qty * close_price
 
@@ -1231,8 +1261,13 @@ class BacktestEngine:
                         if current_time in ticker_df.index:
                             close_price = ticker_df.loc[current_time, "Close"]
                         else:
-                            close_val = self._prev_close_cache[ticker].get(current_time, 0.0) or 0.0
-                            close_price = 0.0 if pd.isna(close_val) else float(close_val)
+                            close_val = (
+                                self._prev_close_cache[ticker].get(current_time, 0.0)
+                                or 0.0
+                            )
+                            close_price = (
+                                0.0 if pd.isna(close_val) else float(close_val)
+                            )
 
                         if close_price > 0:
                             qty_to_sell = qty * (value_to_sell / positions_value)
@@ -1396,14 +1431,21 @@ class BacktestEngine:
                 continue
 
             # Skip if cancelled, filled or expired
-            if order.status in [OrderStatus.CANCELLED, OrderStatus.FILLED, OrderStatus.EXPIRED]:
+            if order.status in [
+                OrderStatus.CANCELLED,
+                OrderStatus.FILLED,
+                OrderStatus.EXPIRED,
+            ]:
                 continue
 
             # Increment bars since placed
             order.bars_since_placed += 1
 
             # Check expiration
-            if order.expiration_bars is not None and order.bars_since_placed > order.expiration_bars:
+            if (
+                order.expiration_bars is not None
+                and order.bars_since_placed > order.expiration_bars
+            ):
                 order.status = OrderStatus.EXPIRED
                 self.order_logs.append(
                     {
@@ -1521,7 +1563,7 @@ class BacktestEngine:
                 if not stop_triggered:
                     self.pending_orders.append(order)
                     continue
-                
+
                 # If stop triggered and limit_price is present, check limit condition
                 if order.limit_price is not None:
                     if action == "buy":
@@ -1866,7 +1908,7 @@ class BacktestEngine:
                     "TimePlaced": time_placed,
                 }
                 self.trades_history.append(trade_record)
-                
+
                 # Update Order status
                 order.filled_quantity += qty
                 deferred_qty = original_qty - qty
@@ -2072,7 +2114,7 @@ class BacktestEngine:
                     "TimePlaced": time_placed,
                 }
                 self.trades_history.append(trade_record)
-                
+
                 # Update Order status
                 order.filled_quantity += qty
                 order.remaining_quantity = deferred_qty

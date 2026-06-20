@@ -261,11 +261,11 @@ class PerformanceAnalyzer:
 
             # Calculate stats from completed trades
             n_completed = len(completed_trades)
-            
+
             # BUG FIX: total_trades should be the number of completed round-trips
             # (BUY→SELL pairs), not the raw count of BUY + SELL orders.
             total_trades = n_completed
-            
+
             if n_completed > 0:
                 trade_returns = [tc["return"] for tc in completed_trades]
                 trade_profits = [tc["profit"] for tc in completed_trades]
@@ -325,6 +325,7 @@ class PerformanceAnalyzer:
             bench_close_aligned = bench_close.reindex(strategy_index).ffill()
             if bench_close_aligned.isna().any():
                 import logging
+
                 logging.warning(
                     "Dữ liệu benchmark có giá trị NaN ở các ngày đầu của backtest. "
                     "Chiến lược bắt đầu trước khi có dữ liệu benchmark; "
@@ -386,8 +387,8 @@ class PerformanceAnalyzer:
             "sortino_ratio": sortino_ratio,
             "max_drawdown": max_drawdown,
             "max_drawdown_duration": max_dd_duration,
-            "total_trades": total_trades,   # Số round-trips hoàn chỉnh (BUY→SELL)
-            "total_orders": total_orders,    # Tổng số lệnh BUY + SELL (raw order count)
+            "total_trades": total_trades,  # Số round-trips hoàn chỉnh (BUY→SELL)
+            "total_orders": total_orders,  # Tổng số lệnh BUY + SELL (raw order count)
             "win_rate": win_rate,
             "profit_factor": profit_factor,
             "avg_trade_return": avg_trade_return,

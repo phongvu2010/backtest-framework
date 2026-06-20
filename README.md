@@ -44,7 +44,7 @@ Framework yêu cầu **Python >= 3.12**.
 
 Cài đặt ở chế độ phát triển (development mode):
 ```bash
-git clone https://github.com/phongvu2010/vn-backtest.git
+git clone https://github.com/phongvu2010/backtest-framework.git
 cd vn-backtest
 pip install -e .
 ```
@@ -63,7 +63,7 @@ from vn_backtest.analysis import PerformanceAnalyzer
 from vn_backtest.reporter import ReportGenerator
 
 # 1. Định nghĩa chỉ báo Simple Moving Average (SMA)
-def SMA(data, period, column='Close'):
+def SMA(data, period, column="Close"):
     return data[column].rolling(window=period).mean()
 
 # 2. Xây dựng Chiến lược đa tài sản
@@ -167,8 +167,8 @@ Bạn có thể tìm kiếm tổ hợp tham số tối ưu bằng cách sử d�
 from vn_backtest.optimizer import ParameterOptimizer
 
 param_grid = {
-    'sma_fast': [5, 10, 15],
-    'sma_slow': [20, 30, 50]
+    "sma_fast": [5, 10, 15],
+    "sma_slow": [20, 30, 50]
 }
 
 optimizer = ParameterOptimizer(

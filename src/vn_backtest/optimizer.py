@@ -126,7 +126,9 @@ class ParameterOptimizer:
         permutations = [dict(zip(keys, v)) for v in itertools.product(*values)]
 
         print("=" * 60)
-        logger.info(f"KHỞI CHẠY TỐI ƯU HÓA THAM SỐ (Tổng cộng {len(permutations)} tổ hợp)")
+        logger.info(
+            f"KHỞI CHẠY TỐI ƯU HÓA THAM SỐ (Tổng cộng {len(permutations)} tổ hợp)"
+        )
         print("=" * 60)
 
         results = []
@@ -134,7 +136,9 @@ class ParameterOptimizer:
         if self.n_jobs == 1:
             # Run sequentially
             for idx, params in enumerate(permutations, 1):
-                logger.debug(f"[{idx}/{len(permutations)}] Đang chạy thử nghiệm với tham số (tuần tự): {params}...")
+                logger.debug(
+                    f"[{idx}/{len(permutations)}] Đang chạy thử nghiệm với tham số (tuần tự): {params}..."
+                )
                 task_args = (
                     idx,
                     params,
@@ -190,7 +194,9 @@ class ParameterOptimizer:
                             logger.error(f"LỖI khi chạy tổ hợp {params}: {err[1]}")
                         else:
                             # Dùng level DEBUG để không làm nhiễu Console, nhưng vẫn tracking được
-                            logger.debug(f"[{len(results)+1}/{len(permutations)}] Đã hoàn thành tham số: {record}")
+                            logger.debug(
+                                f"[{len(results)+1}/{len(permutations)}] Đã hoàn thành tham số: {record}"
+                            )
                             results.append(record)
                     except Exception as e:
                         logger.critical(f"LỖI HỆ THỐNG khi chạy tổ hợp {params}: {e}")
@@ -257,7 +263,9 @@ class ParameterOptimizer:
             )
 
         print("=" * 60)
-        logger.info(f"KHỞI CHẠY TỐI ƯU HÓA OPTUNA (Số lượt chạy thử nghiệm: {n_trials})")
+        logger.info(
+            f"KHỞI CHẠY TỐI ƯU HÓA OPTUNA (Số lượt chạy thử nghiệm: {n_trials})"
+        )
         print("=" * 60)
 
         # Optuna logging level
@@ -286,7 +294,9 @@ class ParameterOptimizer:
 
             if err:
                 # If backtest fails, return a bad value
-                logger.error(f"Optuna Trial {trial.number} failed with parameters {params}: {err[1]}")
+                logger.error(
+                    f"Optuna Trial {trial.number} failed with parameters {params}: {err[1]}"
+                )
                 return float("-inf") if not ascending else float("inf")
 
             # Store the metrics on the trial for later retrieval

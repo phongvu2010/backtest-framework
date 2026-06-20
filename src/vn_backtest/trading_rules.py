@@ -2,11 +2,13 @@ import pandas as pd
 import numpy as np
 from typing import Dict
 
+
 class TradingRulesManager:
     """
     Helper class to convert Vietnamese exchange rules into tick sizes, lot sizes,
     price limits, and settlement periods.
     """
+
     def __init__(
         self,
         dynamic_rules: bool = True,
@@ -64,7 +66,9 @@ class TradingRulesManager:
     ) -> float:
         # Convert to VND integers to avoid floating point division issues (since 1 VND is the smallest unit)
         price_vnd = round(price * self.price_scale)
-        tick_vnd = round(self.get_tick_size(price, exchange, current_time) * self.price_scale)
+        tick_vnd = round(
+            self.get_tick_size(price, exchange, current_time) * self.price_scale
+        )
 
         if direction == "down":  # Ceiling
             res_vnd = (price_vnd // tick_vnd) * tick_vnd
@@ -130,10 +134,10 @@ class TradingRulesManager:
         if is_listing_day:
             if exch == "hose":
                 return 0.20
-              # HNX
+            # HNX
             elif exch == "hnx":
                 return 0.30
-              # UPCOM
+            # UPCOM
             elif exch == "upcom":
                 return 0.40
             return 0.0

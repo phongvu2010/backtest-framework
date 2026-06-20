@@ -82,8 +82,12 @@ class ReportGenerator:
                     else equity_df.index
                 )
 
-                bench_close_aligned = bench_close.reindex(strategy_index).ffill().bfill()
-                bench_normalized = (bench_close_aligned / bench_close_aligned.iloc[0]) * 100
+                bench_close_aligned = (
+                    bench_close.reindex(strategy_index).ffill().bfill()
+                )
+                bench_normalized = (
+                    bench_close_aligned / bench_close_aligned.iloc[0]
+                ) * 100
                 fig_equity.add_trace(
                     go.Scatter(
                         x=bench_normalized.index,
@@ -179,7 +183,9 @@ class ReportGenerator:
                 trades_df_no_tz = trades_df.copy()
                 trades_df_no_tz["Date"] = pd.to_datetime(trades_df_no_tz["Date"])
                 if trades_df_no_tz["Date"].dt.tz is not None:
-                    trades_df_no_tz["Date"] = trades_df_no_tz["Date"].dt.tz_localize(None)
+                    trades_df_no_tz["Date"] = trades_df_no_tz["Date"].dt.tz_localize(
+                        None
+                    )
 
                 ticker_trades = trades_df_no_tz[trades_df_no_tz["Ticker"] == ticker]
                 buys = ticker_trades[ticker_trades["Action"] == "BUY"]
@@ -368,7 +374,9 @@ class ReportGenerator:
         equity_html = pio.to_html(fig_equity, include_plotlyjs=False, full_html=False)
         dd_html = pio.to_html(fig_dd, include_plotlyjs=False, full_html=False)
         signals_html = pio.to_html(fig_signals, include_plotlyjs=False, full_html=False)
-        allocation_html = pio.to_html(fig_alloc, include_plotlyjs=False, full_html=False)
+        allocation_html = pio.to_html(
+            fig_alloc, include_plotlyjs=False, full_html=False
+        )
 
         return equity_html, dd_html, signals_html, allocation_html
 
@@ -391,8 +399,10 @@ class ReportGenerator:
             str: Path to the generated report file.
         """
         # Generate chart HTML snippets
-        equity_chart, dd_chart, signals_chart, allocation_chart = self._generate_plotly_html(
-            equity_curve, trades, stock_data, benchmark_data, benchmark_symbol
+        equity_chart, dd_chart, signals_chart, allocation_chart = (
+            self._generate_plotly_html(
+                equity_curve, trades, stock_data, benchmark_data, benchmark_symbol
+            )
         )
 
         # Prepare HTML template variables
@@ -441,16 +451,18 @@ class ReportGenerator:
                 avg_ret = g["return"].mean()
                 best_ret = g["return"].max()
                 worst_ret = g["return"].min()
-                ticker_summary.append({
-                    "ticker": tk,
-                    "total_trades": len(g),
-                    "win_rate": f"{win_rate * 100:.1f}%",
-                    "pnl": f"{total_pnl:,.0f} VND",
-                    "pnl_raw": total_pnl,
-                    "avg_return": f"{avg_ret * 100:.2f}%",
-                    "best_trade": f"{best_ret * 100:.2f}%",
-                    "worst_trade": f"{worst_ret * 100:.2f}%"
-                })
+                ticker_summary.append(
+                    {
+                        "ticker": tk,
+                        "total_trades": len(g),
+                        "win_rate": f"{win_rate * 100:.1f}%",
+                        "pnl": f"{total_pnl:,.0f} VND",
+                        "pnl_raw": total_pnl,
+                        "avg_return": f"{avg_ret * 100:.2f}%",
+                        "best_trade": f"{best_ret * 100:.2f}%",
+                        "worst_trade": f"{worst_ret * 100:.2f}%",
+                    }
+                )
 
         # Read external template files from Jinja2 Environment
         template = _JINJA_ENV.get_template("backtest_report.html")
@@ -511,7 +523,9 @@ class ReportGenerator:
             p2 = param_cols[1]
 
             # Construct a pivot table for the heatmap
-            pivot_df = results_df.pivot_table(index=p1, columns=p2, values="sharpe_ratio", aggfunc='mean')
+            pivot_df = results_df.pivot_table(
+                index=p1, columns=p2, values="sharpe_ratio", aggfunc="mean"
+            )
 
             fig_opt.add_trace(
                 go.Heatmap(
