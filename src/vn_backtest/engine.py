@@ -22,6 +22,8 @@ class OrderType:
     LIMIT = "LIMIT"
     STOP = "STOP"
     OCO = "OCO"
+    ATO = "ATO"
+    ATC = "ATC"
 
 
 class Order:
@@ -280,24 +282,28 @@ class BacktestEngine:
         stop_price: float = None,
         expiration_bars: int = None,
         oco_sibling_id: str = None,
+        order_type: str = None,
     ) -> Order:
         """Queue a buy order for the next bar."""
         self.order_counter += 1
         order_id = f"order_{self.order_counter}"
         
-        order_type = OrderType.MARKET
-        if limit_price is not None:
-            order_type = OrderType.LIMIT
-        if stop_price is not None:
-            order_type = OrderType.STOP
-        if oco_sibling_id is not None:
-            order_type = OrderType.OCO
+        if order_type is not None:
+            resolved_type = order_type.upper()
+        else:
+            resolved_type = OrderType.MARKET
+            if limit_price is not None:
+                resolved_type = OrderType.LIMIT
+            if stop_price is not None:
+                resolved_type = OrderType.STOP
+            if oco_sibling_id is not None:
+                resolved_type = OrderType.OCO
             
         order = Order(
             order_id=order_id,
             ticker=ticker,
             action="buy",
-            order_type=order_type,
+            order_type=resolved_type,
             size=size,
             limit_price=limit_price,
             stop_price=stop_price,
@@ -317,24 +323,28 @@ class BacktestEngine:
         stop_price: float = None,
         expiration_bars: int = None,
         oco_sibling_id: str = None,
+        order_type: str = None,
     ) -> Order:
         """Queue a sell order for the next bar."""
         self.order_counter += 1
         order_id = f"order_{self.order_counter}"
         
-        order_type = OrderType.MARKET
-        if limit_price is not None:
-            order_type = OrderType.LIMIT
-        if stop_price is not None:
-            order_type = OrderType.STOP
-        if oco_sibling_id is not None:
-            order_type = OrderType.OCO
+        if order_type is not None:
+            resolved_type = order_type.upper()
+        else:
+            resolved_type = OrderType.MARKET
+            if limit_price is not None:
+                resolved_type = OrderType.LIMIT
+            if stop_price is not None:
+                resolved_type = OrderType.STOP
+            if oco_sibling_id is not None:
+                resolved_type = OrderType.OCO
             
         order = Order(
             order_id=order_id,
             ticker=ticker,
             action="sell",
-            order_type=order_type,
+            order_type=resolved_type,
             size=size,
             limit_price=limit_price,
             stop_price=stop_price,
@@ -1247,14 +1257,22 @@ class BacktestEngine:
                                 )
 
             # Save history
-            self.portfolio_history.append(
-                {
-                    "Date": current_time,
-                    "Cash": self.cash,
-                    "AvailableCash": self.available_cash,
-                    "Equity": equity,
-                }
-            )
+            history_record = {
+                "Date": current_time,
+                "Cash": self.cash,
+                "AvailableCash": self.available_cash,
+                "Equity": equity,
+            }
+            # Record individual ticker valuations for portfolio analysis
+            for t in self.data:
+                q = self.positions.get(t, 0)
+                if current_time in self.data[t].index:
+                    c_price = self.data[t].loc[current_time, "Close"]
+                else:
+                    c_val = self._prev_close_cache[t].get(current_time, 0.0) or 0.0
+                    c_price = 0.0 if pd.isna(c_val) else float(c_val)
+                history_record[f"Val_{t}"] = q * c_price
+            self.portfolio_history.append(history_record)
 
             # 5. Call strategy's next() to make new trading decisions
             if idx < n_bars - 1:
@@ -1331,6 +1349,8 @@ class BacktestEngine:
             self.portfolio_history[-1]["Cash"] = self.cash
             self.portfolio_history[-1]["AvailableCash"] = self.available_cash
             self.portfolio_history[-1]["Equity"] = self.cash
+            for t in self.data:
+                self.portfolio_history[-1][f"Val_{t}"] = 0.0
 
         # Create output DataFrames
         equity_df = pd.DataFrame(self.portfolio_history).set_index("Date")
@@ -1407,8 +1427,21 @@ class BacktestEngine:
             # Check if ticker traded on current_time
             ticker_df = self.data[ticker]
             if current_time not in ticker_df.index:
-                # Keep order pending if ticker didn't trade today
-                self.pending_orders.append(order)
+                if order.order_type in ["ATO", "ATC"]:
+                    order.status = OrderStatus.CANCELLED
+                    self.order_logs.append(
+                        {
+                            "Date": current_time,
+                            "Ticker": ticker,
+                            "Action": f"{order.order_type}_CANCELLED",
+                            "Reason": "Ticker did not trade on execution day",
+                            "Price": 0.0,
+                            "Quantity": order.quantity,
+                        }
+                    )
+                else:
+                    # Keep order pending if ticker didn't trade today
+                    self.pending_orders.append(order)
                 continue
 
             row = ticker_df.loc[current_time]
@@ -1416,18 +1449,31 @@ class BacktestEngine:
             if ("Traded" in row and row["Traded"] == 0) or (
                 "Volume" in row and (pd.isna(row["Volume"]) or row["Volume"] <= 0)
             ):
-                # Keep order pending if ticker didn't trade
-                self.pending_orders.append(order)
-                self.order_logs.append(
-                    {
-                        "Date": current_time,
-                        "Ticker": ticker,
-                        "Action": f"{action.upper()}_DEFERRED",
-                        "Reason": "Zero trading volume or suspended trading",
-                        "Price": 0.0,
-                        "Quantity": 0,
-                    }
-                )
+                if order.order_type in ["ATO", "ATC"]:
+                    order.status = OrderStatus.CANCELLED
+                    self.order_logs.append(
+                        {
+                            "Date": current_time,
+                            "Ticker": ticker,
+                            "Action": f"{order.order_type}_CANCELLED",
+                            "Reason": "Zero trading volume or suspended trading on execution day",
+                            "Price": 0.0,
+                            "Quantity": order.quantity,
+                        }
+                    )
+                else:
+                    # Keep order pending if ticker didn't trade
+                    self.pending_orders.append(order)
+                    self.order_logs.append(
+                        {
+                            "Date": current_time,
+                            "Ticker": ticker,
+                            "Action": f"{action.upper()}_DEFERRED",
+                            "Reason": "Zero trading volume or suspended trading",
+                            "Price": 0.0,
+                            "Quantity": 0,
+                        }
+                    )
                 continue
 
             prev_close = prev_closes.get(ticker)
@@ -1455,8 +1501,13 @@ class BacktestEngine:
                 1 if self._is_odd_lot_allowed(ticker, current_time) else lot_size
             )
 
+            # Determine base price and execution type
+            if order.order_type == "ATO":
+                base_price = float(row["Open"])
+            elif order.order_type == "ATC":
+                base_price = float(row["Close"])
             # Check Stop Order condition
-            if order.stop_price is not None:
+            elif order.stop_price is not None:
                 stop_triggered = False
                 if action == "buy":
                     if row["High"] >= order.stop_price:
@@ -1543,10 +1594,15 @@ class BacktestEngine:
                     self.cancel_order(order.oco_sibling_id)
                 continue
 
-            # Apply Slippage (only for market/stop orders)
+            # Apply Slippage (only for market/stop orders, excluding ATO/ATC)
             exec_price = base_price
             limit_price = order.limit_price
-            if limit_price is None:
+            if order.order_type in ["ATO", "ATC"]:
+                # Round to nearest tick for auction price just in case
+                exec_price = self._round_to_tick(
+                    exec_price, exch, "nearest", current_time
+                )
+            elif limit_price is None:
                 # Calculate percentage slippage
                 pct_slippage = self.slippage
                 if (
@@ -1609,18 +1665,31 @@ class BacktestEngine:
                         qty = max_qty
 
                 if qty <= 0:
-                    # Defer the whole buy order to the next day
-                    self.pending_orders.append(order)
-                    self.order_logs.append(
-                        {
-                            "Date": current_time,
-                            "Ticker": ticker,
-                            "Action": "BUY_DEFERRED",
-                            "Reason": f"Target quantity scaled to 0 due to volume limits (deferred {original_qty} shares)",
-                            "Price": exec_price,
-                            "Quantity": original_qty,
-                        }
-                    )
+                    if order.order_type in ["ATO", "ATC"]:
+                        order.status = OrderStatus.CANCELLED
+                        self.order_logs.append(
+                            {
+                                "Date": current_time,
+                                "Ticker": ticker,
+                                "Action": f"{order.order_type}_CANCELLED",
+                                "Reason": f"Target quantity scaled to 0 due to volume limits (cancelled {original_qty} shares)",
+                                "Price": exec_price,
+                                "Quantity": original_qty,
+                            }
+                        )
+                    else:
+                        # Defer the whole buy order to the next day
+                        self.pending_orders.append(order)
+                        self.order_logs.append(
+                            {
+                                "Date": current_time,
+                                "Ticker": ticker,
+                                "Action": "BUY_DEFERRED",
+                                "Reason": f"Target quantity scaled to 0 due to volume limits (deferred {original_qty} shares)",
+                                "Price": exec_price,
+                                "Quantity": original_qty,
+                            }
+                        )
                     continue
 
                 # Calculate Net Equity and max spend for margin trading
@@ -1804,23 +1873,41 @@ class BacktestEngine:
                 order.remaining_quantity = deferred_qty
 
                 if deferred_qty > 0:
-                    order.status = OrderStatus.PARTIALLY_FILLED
-                    self.pending_orders.append(order)
-                    self.order_logs.append(
-                        {
-                            "Date": current_time,
-                            "Ticker": ticker,
-                            "Action": "BUY_PARTIALLY_FILLED",
-                            "Reason": f"Bought {qty} shares, deferred {deferred_qty} due to volume limits/cash"
-                            + (
-                                f" (Ứng trước, phí: {advance_fee:,.0f}đ)"
-                                if advance_fee > 0
-                                else ""
-                            ),
-                            "Price": exec_price,
-                            "Quantity": qty,
-                        }
-                    )
+                    if order.order_type in ["ATO", "ATC"]:
+                        order.status = OrderStatus.PARTIALLY_FILLED
+                        self.order_logs.append(
+                            {
+                                "Date": current_time,
+                                "Ticker": ticker,
+                                "Action": f"BUY_PARTIALLY_FILLED_CANCEL_REMAINING",
+                                "Reason": f"Bought {qty} shares, cancelled remaining {deferred_qty} due to volume limits/cash"
+                                + (
+                                    f" (Ứng trước, phí: {advance_fee:,.0f}đ)"
+                                    if advance_fee > 0
+                                    else ""
+                                ),
+                                "Price": exec_price,
+                                "Quantity": qty,
+                            }
+                        )
+                    else:
+                        order.status = OrderStatus.PARTIALLY_FILLED
+                        self.pending_orders.append(order)
+                        self.order_logs.append(
+                            {
+                                "Date": current_time,
+                                "Ticker": ticker,
+                                "Action": "BUY_PARTIALLY_FILLED",
+                                "Reason": f"Bought {qty} shares, deferred {deferred_qty} due to volume limits/cash"
+                                + (
+                                    f" (Ứng trước, phí: {advance_fee:,.0f}đ)"
+                                    if advance_fee > 0
+                                    else ""
+                                ),
+                                "Price": exec_price,
+                                "Quantity": qty,
+                            }
+                        )
                 else:
                     order.status = OrderStatus.FILLED
                     self.order_logs.append(
@@ -1874,18 +1961,31 @@ class BacktestEngine:
                 deferred_qty = original_qty - qty
 
                 if qty <= 0:
-                    # Defer the whole order to the next day
-                    self.pending_orders.append(order)
-                    self.order_logs.append(
-                        {
-                            "Date": current_time,
-                            "Ticker": ticker,
-                            "Action": "SELL_DEFERRED",
-                            "Reason": f"All shares locked in settlement (deferred {original_qty} shares)",
-                            "Price": exec_price,
-                            "Quantity": original_qty,
-                        }
-                    )
+                    if order.order_type in ["ATO", "ATC"]:
+                        order.status = OrderStatus.CANCELLED
+                        self.order_logs.append(
+                            {
+                                "Date": current_time,
+                                "Ticker": ticker,
+                                "Action": f"{order.order_type}_CANCELLED",
+                                "Reason": f"All shares locked in settlement (cancelled {original_qty} shares)",
+                                "Price": exec_price,
+                                "Quantity": original_qty,
+                            }
+                        )
+                    else:
+                        # Defer the whole order to the next day
+                        self.pending_orders.append(order)
+                        self.order_logs.append(
+                            {
+                                "Date": current_time,
+                                "Ticker": ticker,
+                                "Action": "SELL_DEFERRED",
+                                "Reason": f"All shares locked in settlement (deferred {original_qty} shares)",
+                                "Price": exec_price,
+                                "Quantity": original_qty,
+                            }
+                        )
                     continue
 
                 # Apply volume limit constraint if specified
@@ -1978,18 +2078,31 @@ class BacktestEngine:
                 order.remaining_quantity = deferred_qty
 
                 if deferred_qty > 0:
-                    order.status = OrderStatus.PARTIALLY_FILLED
-                    self.pending_orders.append(order)
-                    self.order_logs.append(
-                        {
-                            "Date": current_time,
-                            "Ticker": ticker,
-                            "Action": "SELL_PARTIALLY_FILLED",
-                            "Reason": f"Sold {qty} shares, deferred {deferred_qty} due to settlement lock/volume limits",
-                            "Price": exec_price,
-                            "Quantity": qty,
-                        }
-                    )
+                    if order.order_type in ["ATO", "ATC"]:
+                        order.status = OrderStatus.PARTIALLY_FILLED
+                        self.order_logs.append(
+                            {
+                                "Date": current_time,
+                                "Ticker": ticker,
+                                "Action": f"SELL_PARTIALLY_FILLED_CANCEL_REMAINING",
+                                "Reason": f"Sold {qty} shares, cancelled remaining {deferred_qty} due to settlement lock/volume limits",
+                                "Price": exec_price,
+                                "Quantity": qty,
+                            }
+                        )
+                    else:
+                        order.status = OrderStatus.PARTIALLY_FILLED
+                        self.pending_orders.append(order)
+                        self.order_logs.append(
+                            {
+                                "Date": current_time,
+                                "Ticker": ticker,
+                                "Action": "SELL_PARTIALLY_FILLED",
+                                "Reason": f"Sold {qty} shares, deferred {deferred_qty} due to settlement lock/volume limits",
+                                "Price": exec_price,
+                                "Quantity": qty,
+                            }
+                        )
                 else:
                     order.status = OrderStatus.FILLED
                     self.order_logs.append(

@@ -176,6 +176,7 @@ class Strategy:
         stop_price: float = None,
         expiration_bars: int = None,
         oco_sibling: Any = None,
+        order_type: str = None,
     ) -> Any:
         """
         Place a Buy Order.
@@ -190,6 +191,7 @@ class Strategy:
             stop_price (float, optional): Stop price for the order.
             expiration_bars (int, optional): Expiration of the order in number of bars.
             oco_sibling (Order, optional): Sibling OCO order.
+            order_type (str, optional): Custom order type (e.g. 'ATO', 'ATC').
         """
         oco_sibling_id = oco_sibling.order_id if oco_sibling is not None else None
         order = self.engine.place_buy_order(
@@ -200,6 +202,7 @@ class Strategy:
             stop_price=stop_price,
             expiration_bars=expiration_bars,
             oco_sibling_id=oco_sibling_id,
+            order_type=order_type,
         )
         if oco_sibling is not None:
             # Bidirectional linking
@@ -216,6 +219,7 @@ class Strategy:
         stop_price: float = None,
         expiration_bars: int = None,
         oco_sibling: Any = None,
+        order_type: str = None,
     ) -> Any:
         """
         Place a Sell Order.
@@ -230,6 +234,7 @@ class Strategy:
             stop_price (float, optional): Stop price for the order.
             expiration_bars (int, optional): Expiration of the order in number of bars.
             oco_sibling (Order, optional): Sibling OCO order.
+            order_type (str, optional): Custom order type (e.g. 'ATO', 'ATC').
         """
         oco_sibling_id = oco_sibling.order_id if oco_sibling is not None else None
         order = self.engine.place_sell_order(
@@ -240,6 +245,7 @@ class Strategy:
             stop_price=stop_price,
             expiration_bars=expiration_bars,
             oco_sibling_id=oco_sibling_id,
+            order_type=order_type,
         )
         if oco_sibling is not None:
             # Bidirectional linking

@@ -206,9 +206,9 @@ class ReportGenerator:
         equity_df: pd.DataFrame,
         trades_df: pd.DataFrame,
         stock_df: Union[pd.DataFrame, Dict[str, pd.DataFrame]],
-        benchmark_df: pd.DataFrame = None,
+        benchmark_df: Union[pd.DataFrame, Dict[str, pd.DataFrame]] = None,
         benchmark_symbol: str = "VNINDEX",
-    ) -> str:
+    ) -> tuple[str, str, str, str]:
         """Create the interactive Plotly figures and return their HTML snippets."""
         # 1. Chart 1: Equity Curve vs Benchmark (Normalized to 100)
         fig_equity = go.Figure()
@@ -226,31 +226,40 @@ class ReportGenerator:
             )
         )
 
-        # Benchmark normalized equity
-        if benchmark_df is not None and not benchmark_df.empty:
-            # Drop timezone information if present
-            bench_close = benchmark_df["Close"].copy()
-            bench_close.index = (
-                bench_close.index.tz_convert(None)
-                if bench_close.index.tz is not None
-                else bench_close.index
-            )
-            strategy_index = (
-                equity_df.index.tz_convert(None)
-                if equity_df.index.tz is not None
-                else equity_df.index
-            )
+        # Benchmark normalized equity (supports DataFrame or Dict of DataFrames)
+        if benchmark_df is not None:
+            benchmarks_to_plot = {}
+            if isinstance(benchmark_df, dict):
+                benchmarks_to_plot = benchmark_df
+            elif isinstance(benchmark_df, pd.DataFrame) and not benchmark_df.empty:
+                benchmarks_to_plot = {benchmark_symbol: benchmark_df}
 
-            bench_close_aligned = bench_close.reindex(strategy_index).ffill().bfill()
-            bench_normalized = (bench_close_aligned / bench_close_aligned.iloc[0]) * 100
-            fig_equity.add_trace(
-                go.Scatter(
-                    x=bench_normalized.index,
-                    y=bench_normalized,
-                    name=f"Benchmark ({benchmark_symbol})",
-                    line=dict(color="#ff9900", width=2, dash="dash"),
+            for bench_name, df_bench in benchmarks_to_plot.items():
+                if df_bench.empty:
+                    continue
+                # Drop timezone information if present
+                bench_close = df_bench["Close"].copy()
+                bench_close.index = (
+                    bench_close.index.tz_localize(None)
+                    if bench_close.index.tz is not None
+                    else bench_close.index
                 )
-            )
+                strategy_index = (
+                    equity_df.index.tz_localize(None)
+                    if equity_df.index.tz is not None
+                    else equity_df.index
+                )
+
+                bench_close_aligned = bench_close.reindex(strategy_index).ffill().bfill()
+                bench_normalized = (bench_close_aligned / bench_close_aligned.iloc[0]) * 100
+                fig_equity.add_trace(
+                    go.Scatter(
+                        x=bench_normalized.index,
+                        y=bench_normalized,
+                        name=f"Benchmark ({bench_name})",
+                        line=dict(width=2, dash="dash"),
+                    )
+                )
 
         fig_equity.update_layout(
             title="<b>TĂNG TRƯỞNG TÀI SẢN TÍCH LŨY (Chuẩn hóa về 100)</b>",
@@ -314,7 +323,7 @@ class ReportGenerator:
             df = stock_df[ticker]
             df_no_tz = df.copy()
             df_no_tz.index = (
-                df_no_tz.index.tz_convert(None)
+                df_no_tz.index.tz_localize(None)
                 if df_no_tz.index.tz is not None
                 else df_no_tz.index
             )
@@ -338,7 +347,7 @@ class ReportGenerator:
                 trades_df_no_tz = trades_df.copy()
                 trades_df_no_tz["Date"] = pd.to_datetime(trades_df_no_tz["Date"])
                 if trades_df_no_tz["Date"].dt.tz is not None:
-                    trades_df_no_tz["Date"] = trades_df_no_tz["Date"].dt.tz_convert(None)
+                    trades_df_no_tz["Date"] = trades_df_no_tz["Date"].dt.tz_localize(None)
 
                 ticker_trades = trades_df_no_tz[trades_df_no_tz["Ticker"] == ticker]
                 buys = ticker_trades[ticker_trades["Action"] == "BUY"]
@@ -475,12 +484,61 @@ class ReportGenerator:
         fig_signals.update_xaxes(showgrid=True, gridcolor="rgba(255,255,255,0.05)")
         fig_signals.update_yaxes(showgrid=True, gridcolor="rgba(255,255,255,0.05)")
 
+        # 4. Chart 4: Asset Allocation Stacked Area Chart
+        fig_alloc = go.Figure()
+        pos_cols = [col for col in equity_df.columns if col.startswith("Val_")]
+        total_equity = equity_df["Equity"]
+
+        # Cash allocation
+        cash_pct = (equity_df["Cash"] / total_equity) * 100
+        fig_alloc.add_trace(
+            go.Scatter(
+                x=equity_df.index,
+                y=cash_pct,
+                name="TIỀN MẶT (Cash)",
+                stackgroup="one",
+                mode="lines",
+                line=dict(width=0.5),
+                fillcolor="rgba(156, 163, 175, 0.35)",
+            )
+        )
+
+        for col in pos_cols:
+            ticker_name = col.replace("Val_", "")
+            val_pct = (equity_df[col] / total_equity) * 100
+            fig_alloc.add_trace(
+                go.Scatter(
+                    x=equity_df.index,
+                    y=val_pct,
+                    name=ticker_name,
+                    stackgroup="one",
+                    mode="lines",
+                    line=dict(width=0.5),
+                )
+            )
+
+        fig_alloc.update_layout(
+            title="<b>PHÂN BỔ TỶ TRỌNG TÀI SẢN THEO THỜI GIAN (%)</b>",
+            xaxis_title="Ngày",
+            yaxis_title="Tỷ trọng (%)",
+            hovermode="x unified",
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
+            legend=dict(x=0.01, y=0.99, bgcolor="rgba(15, 23, 42, 0.8)"),
+            margin=dict(l=20, r=20, t=50, b=20),
+            height=320,
+            yaxis=dict(range=[0, 100]),
+        )
+        fig_alloc.update_xaxes(showgrid=True, gridcolor="rgba(255,255,255,0.05)")
+        fig_alloc.update_yaxes(showgrid=True, gridcolor="rgba(255,255,255,0.05)")
+
         # Convert to HTML snippets (div tags)
         equity_html = pio.to_html(fig_equity, include_plotlyjs=False, full_html=False)
         dd_html = pio.to_html(fig_dd, include_plotlyjs=False, full_html=False)
         signals_html = pio.to_html(fig_signals, include_plotlyjs=False, full_html=False)
+        allocation_html = pio.to_html(fig_alloc, include_plotlyjs=False, full_html=False)
 
-        return equity_html, dd_html, signals_html
+        return equity_html, dd_html, signals_html, allocation_html
 
     def generate_report(
         self,
@@ -490,7 +548,7 @@ class ReportGenerator:
         stock_data: Union[pd.DataFrame, Dict[str, pd.DataFrame]],
         ticker: str,
         strategy_name: str,
-        benchmark_data: pd.DataFrame = None,
+        benchmark_data: Union[pd.DataFrame, Dict[str, pd.DataFrame]] = None,
         filename: str = "backtest_report.html",
         benchmark_symbol: str = "VNINDEX",
     ) -> str:
@@ -501,7 +559,7 @@ class ReportGenerator:
             str: Path to the generated report file.
         """
         # Generate chart HTML snippets
-        equity_chart, dd_chart, signals_chart = self._generate_plotly_html(
+        equity_chart, dd_chart, signals_chart, allocation_chart = self._generate_plotly_html(
             equity_curve, trades, stock_data, benchmark_data, benchmark_symbol
         )
 
@@ -539,6 +597,29 @@ class ReportGenerator:
                     }
                 )
 
+        # Calculate ticker performance summary
+        completed_trades = metrics.get("completed_trades", [])
+        ticker_summary = []
+        if completed_trades:
+            df_comp = pd.DataFrame(completed_trades)
+            for tk, g in df_comp.groupby("ticker"):
+                wins = g[g["profit"] > 0]
+                total_pnl = g["profit"].sum()
+                win_rate = len(wins) / len(g) if len(g) > 0 else 0.0
+                avg_ret = g["return"].mean()
+                best_ret = g["return"].max()
+                worst_ret = g["return"].min()
+                ticker_summary.append({
+                    "ticker": tk,
+                    "total_trades": len(g),
+                    "win_rate": f"{win_rate * 100:.1f}%",
+                    "pnl": f"{total_pnl:,.0f} VND",
+                    "pnl_raw": total_pnl,
+                    "avg_return": f"{avg_ret * 100:.2f}%",
+                    "best_trade": f"{best_ret * 100:.2f}%",
+                    "worst_trade": f"{worst_ret * 100:.2f}%"
+                })
+
         html_content = self.HTML_TEMPLATE.render(
             title=report_title,
             ticker=ticker,
@@ -549,6 +630,8 @@ class ReportGenerator:
             equity_chart=Markup(equity_chart),
             dd_chart=Markup(dd_chart),
             signals_chart=Markup(signals_chart),
+            allocation_chart=Markup(allocation_chart),
+            ticker_summary=ticker_summary,
             benchmark_symbol=benchmark_symbol,
             shared_css=Markup(_SHARED_CSS),
         )
@@ -898,11 +981,51 @@ class ReportGenerator:
                 {{ dd_chart }}
             </div>
 
+            <!-- Full width allocation chart -->
+            <div class="chart-container full-width-chart">
+                {{ allocation_chart }}
+            </div>
+
             <!-- Full width signals chart -->
             <div class="chart-container full-width-chart">
                 {{ signals_chart }}
             </div>
         </div>
+
+        <!-- TICKER PERFORMANCE SUMMARY -->
+        {% if ticker_summary %}
+        <div class="table-container" style="margin-bottom: 2.5rem;">
+            <h3>Tổng hợp hiệu suất giao dịch theo từng mã cổ phiếu</h3>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Mã CP</th>
+                        <th>Tổng số GD</th>
+                        <th>Tỷ lệ thắng</th>
+                        <th>Lợi nhuận ròng</th>
+                        <th>Tỷ suất LN bình quân</th>
+                        <th>Giao dịch tốt nhất</th>
+                        <th>Giao dịch tệ nhất</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for summary in ticker_summary %}
+                    <tr>
+                        <td style="font-weight: 700;">{{ summary.ticker }}</td>
+                        <td>{{ summary.total_trades }}</td>
+                        <td>{{ summary.win_rate }}</td>
+                        <td class="{% if summary.pnl_raw >= 0 %}val-positive{% else %}val-negative{% endif %}">
+                            {{ summary.pnl }}
+                        </td>
+                        <td>{{ summary.avg_return }}</td>
+                        <td class="val-positive">{{ summary.best_trade }}</td>
+                        <td class="val-negative">{{ summary.worst_trade }}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% endif %}
 
         <!-- LATEST TRADES -->
         <div class="table-container">

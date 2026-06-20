@@ -106,6 +106,7 @@ class PerformanceAnalyzer:
             ]
         total_orders = len(actual_buy_sells)
         total_trades = 0  # Will be set to n_completed after FIFO matching
+        completed_trades = []
 
         win_rate = 0.0
         profit_factor = 0.0
@@ -293,14 +294,22 @@ class PerformanceAnalyzer:
         beta = 1.0
         outperformance = 0.0
 
-        if benchmark_data is not None and not benchmark_data.empty:
+        primary_bench_data = None
+        if isinstance(benchmark_data, dict):
+            if benchmark_data:
+                first_key = list(benchmark_data.keys())[0]
+                primary_bench_data = benchmark_data[first_key]
+        elif isinstance(benchmark_data, pd.DataFrame):
+            primary_bench_data = benchmark_data
+
+        if primary_bench_data is not None and not primary_bench_data.empty:
             # Align dates
             aligned_data = pd.DataFrame(index=equity_df.index)
             aligned_data["Strategy_Return"] = daily_returns
 
             # Map benchmark Close to aligned index
             # Drop timezone information to avoid timezone mismatches
-            bench_close = benchmark_data["Close"].copy()
+            bench_close = primary_bench_data["Close"].copy()
             bench_close.index = (
                 bench_close.index.tz_localize(None)
                 if bench_close.index.tz is not None
@@ -391,4 +400,5 @@ class PerformanceAnalyzer:
             "alpha": alpha,
             "beta": beta,
             "risk_free_rate": risk_free_rate,
+            "completed_trades": completed_trades,
         }
