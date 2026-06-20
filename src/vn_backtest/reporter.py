@@ -6,8 +6,189 @@ from plotly.subplots import make_subplots
 import plotly.io as pio
 from typing import Dict, Any, Union
 
+try:
+    from markupsafe import Markup
+except ImportError:
+    from jinja2 import Markup
+
 # Use dark template for Plotly by default
 pio.templates.default = "plotly_dark"
+
+_SHARED_CSS = """
+        :root {
+            --bg-color: #0b0f19;
+            --card-bg: rgba(17, 25, 40, 0.75);
+            --border-color: rgba(255, 255, 255, 0.08);
+            --primary: #00ffcc;
+            --primary-hover: #00cc99;
+            --text-main: #f3f4f6;
+            --text-muted: #9ca3af;
+            --success: #10b981;
+            --danger: #ef4444;
+            --warning: #f59e0b;
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-main);
+            line-height: 1.6;
+            padding: 2rem 1.5rem;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+
+        /* Header Style */
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 2.5rem;
+            padding-bottom: 1.5rem;
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        .header-title h1 {
+            font-family: 'Outfit', sans-serif;
+            font-size: 2.2rem;
+            font-weight: 800;
+            background: linear-gradient(135deg, #00ffcc 0%, #3b82f6 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            margin-bottom: 0.3rem;
+        }
+
+        .header-title p {
+            color: var(--text-muted);
+            font-size: 1rem;
+        }
+
+        .badge {
+            background: rgba(0, 255, 204, 0.15);
+            color: var(--primary);
+            padding: 0.4rem 1rem;
+            border-radius: 50px;
+            font-size: 0.85rem;
+            font-weight: 600;
+            border: 1px solid rgba(0, 255, 204, 0.3);
+            text-transform: uppercase;
+        }
+
+        /* Glassmorphism Card Layout */
+        .grid-metrics {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 1.25rem;
+            margin-bottom: 2.5rem;
+        }
+
+        .card {
+            background: var(--card-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 16px;
+            padding: 1.5rem;
+            box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.3);
+            backdrop-filter: blur(10px);
+            -webkit-backdrop-filter: blur(10px);
+            transition: transform 0.2s, border-color 0.2s;
+        }
+
+        .card:hover {
+            transform: translateY(-3px);
+            border-color: rgba(0, 255, 204, 0.25);
+        }
+
+        .metric-label {
+            color: var(--text-muted);
+            font-size: 0.85rem;
+            font-weight: 500;
+            margin-bottom: 0.5rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+
+        .metric-value {
+            font-family: 'Outfit', sans-serif;
+            font-size: 1.8rem;
+            font-weight: 700;
+            margin-bottom: 0.2rem;
+        }
+
+        .metric-subtext {
+            font-size: 0.8rem;
+            color: var(--text-muted);
+        }
+
+        /* Colored metrics */
+        .val-positive {
+            color: var(--success);
+        }
+
+        .val-negative {
+            color: var(--danger);
+        }
+
+        /* Table Style */
+        .table-container {
+            background: var(--card-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 16px;
+            padding: 1.5rem;
+            overflow-x: auto;
+            box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.3);
+        }
+
+        .table-container h3 {
+            font-family: 'Outfit', sans-serif;
+            font-size: 1.3rem;
+            margin-bottom: 1.2rem;
+            color: var(--text-main);
+            border-left: 4px solid var(--primary);
+            padding-left: 0.75rem;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            text-align: left;
+            font-size: 0.9rem;
+        }
+
+        th {
+            color: var(--text-muted);
+            font-weight: 600;
+            padding: 0.75rem 1rem;
+            border-bottom: 1px solid var(--border-color);
+            text-transform: uppercase;
+            font-size: 0.8rem;
+            letter-spacing: 0.05em;
+        }
+
+        td {
+            padding: 0.85rem 1rem;
+            border-bottom: 1px solid rgba(255,255,255,0.03);
+            color: #d1d5db;
+        }
+
+        tr:hover td {
+            background: rgba(255, 255, 255, 0.02);
+            color: var(--text-main);
+        }
+"""
+
+_JINJA_ENV = jinja2.Environment(
+    autoescape=True,
+    undefined=jinja2.StrictUndefined,
+)
 
 
 class ReportGenerator:
@@ -50,12 +231,12 @@ class ReportGenerator:
             # Drop timezone information if present
             bench_close = benchmark_df["Close"].copy()
             bench_close.index = (
-                bench_close.index.tz_localize(None)
+                bench_close.index.tz_convert(None)
                 if bench_close.index.tz is not None
                 else bench_close.index
             )
             strategy_index = (
-                equity_df.index.tz_localize(None)
+                equity_df.index.tz_convert(None)
                 if equity_df.index.tz is not None
                 else equity_df.index
             )
@@ -133,7 +314,7 @@ class ReportGenerator:
             df = stock_df[ticker]
             df_no_tz = df.copy()
             df_no_tz.index = (
-                df_no_tz.index.tz_localize(None)
+                df_no_tz.index.tz_convert(None)
                 if df_no_tz.index.tz is not None
                 else df_no_tz.index
             )
@@ -155,9 +336,9 @@ class ReportGenerator:
             # Buy/Sell Signals Traces
             if not trades_df.empty:
                 trades_df_no_tz = trades_df.copy()
-                trades_df_no_tz["Date"] = pd.to_datetime(
-                    trades_df_no_tz["Date"]
-                ).dt.tz_localize(None)
+                trades_df_no_tz["Date"] = pd.to_datetime(trades_df_no_tz["Date"])
+                if trades_df_no_tz["Date"].dt.tz is not None:
+                    trades_df_no_tz["Date"] = trades_df_no_tz["Date"].dt.tz_convert(None)
 
                 ticker_trades = trades_df_no_tz[trades_df_no_tz["Ticker"] == ticker]
                 buys = ticker_trades[ticker_trades["Action"] == "BUY"]
@@ -365,10 +546,11 @@ class ReportGenerator:
             metrics=metrics,
             trades=trades_list[:100],  # Show last 100 trades in table
             total_trades_count=len(trades_list),
-            equity_chart=equity_chart,
-            dd_chart=dd_chart,
-            signals_chart=signals_chart,
+            equity_chart=Markup(equity_chart),
+            dd_chart=Markup(dd_chart),
+            signals_chart=Markup(signals_chart),
             benchmark_symbol=benchmark_symbol,
+            shared_css=Markup(_SHARED_CSS),
         )
 
         output_path = os.path.join(self.output_dir, filename)
@@ -417,7 +599,7 @@ class ReportGenerator:
             p2 = param_cols[1]
 
             # Construct a pivot table for the heatmap
-            pivot_df = results_df.pivot(index=p1, columns=p2, values="sharpe_ratio")
+            pivot_df = results_df.pivot_table(index=p1, columns=p2, values="sharpe_ratio", aggfunc='mean')
 
             fig_opt.add_trace(
                 go.Heatmap(
@@ -426,7 +608,7 @@ class ReportGenerator:
                     z=pivot_df.values,
                     colorscale="Viridis",
                     colorbar=dict(title="Sharpe Ratio"),
-                    hovertemplate=f"{p2}: %{{x}}<br>{p1}: %{{y}}<br>Sharpe: %{{z}}:.2f<extra></extra>",
+                    hovertemplate=f"{p2}: %{{x}}<br>{p1}: %{{y}}<br>Sharpe: %{{z:.2f}}<extra></extra>",
                 )
             )
 
@@ -539,7 +721,8 @@ class ReportGenerator:
             strategy_name=strategy_name,
             best=best_metrics,
             leaderboard=leaderboard,
-            chart_html=opt_chart_html,
+            chart_html=Markup(opt_chart_html),
+            shared_css=Markup(_SHARED_CSS),
         )
 
         output_path = os.path.join(self.output_dir, filename)
@@ -549,7 +732,7 @@ class ReportGenerator:
         return output_path
 
     # Jinja2 HTML template with premium design styling (glassmorphism dark mode)
-    HTML_TEMPLATE = jinja2.Template("""
+    HTML_TEMPLATE = _JINJA_ENV.from_string("""
 <!DOCTYPE html>
 <html lang="vi">
 <head>
@@ -563,127 +746,7 @@ class ReportGenerator:
     <!-- Include Plotly JS CDN -->
     <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
     <style>
-        :root {
-            --bg-color: #0b0f19;
-            --card-bg: rgba(17, 25, 40, 0.75);
-            --border-color: rgba(255, 255, 255, 0.08);
-            --primary: #00ffcc;
-            --primary-hover: #00cc99;
-            --text-main: #f3f4f6;
-            --text-muted: #9ca3af;
-            --success: #10b981;
-            --danger: #ef4444;
-            --warning: #f59e0b;
-        }
-
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-
-        body {
-            font-family: 'Inter', sans-serif;
-            background-color: var(--bg-color);
-            color: var(--text-main);
-            line-height: 1.6;
-            padding: 2rem 1.5rem;
-        }
-
-        .container {
-            max-width: 1400px;
-            margin: 0 auto;
-        }
-
-        /* Header Style */
-        header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 2.5rem;
-            padding-bottom: 1.5rem;
-            border-bottom: 1px solid var(--border-color);
-        }
-
-        .header-title h1 {
-            font-family: 'Outfit', sans-serif;
-            font-size: 2.2rem;
-            font-weight: 800;
-            background: linear-gradient(135deg, #00ffcc 0%, #3b82f6 100%);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            margin-bottom: 0.3rem;
-        }
-
-        .header-title p {
-            color: var(--text-muted);
-            font-size: 1rem;
-        }
-
-        .badge {
-            background: rgba(0, 255, 204, 0.15);
-            color: var(--primary);
-            padding: 0.4rem 1rem;
-            border-radius: 50px;
-            font-size: 0.85rem;
-            font-weight: 600;
-            border: 1px solid rgba(0, 255, 204, 0.3);
-            text-transform: uppercase;
-        }
-
-        /* Glassmorphism Card Layout */
-        .grid-metrics {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
-            gap: 1.25rem;
-            margin-bottom: 2.5rem;
-        }
-
-        .card {
-            background: var(--card-bg);
-            border: 1px solid var(--border-color);
-            border-radius: 16px;
-            padding: 1.5rem;
-            box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.3);
-            backdrop-filter: blur(10px);
-            -webkit-backdrop-filter: blur(10px);
-            transition: transform 0.2s, border-color 0.2s;
-        }
-
-        .card:hover {
-            transform: translateY(-3px);
-            border-color: rgba(0, 255, 204, 0.25);
-        }
-
-        .metric-label {
-            color: var(--text-muted);
-            font-size: 0.85rem;
-            font-weight: 500;
-            margin-bottom: 0.5rem;
-            text-transform: uppercase;
-            letter-spacing: 0.05em;
-        }
-
-        .metric-value {
-            font-family: 'Outfit', sans-serif;
-            font-size: 1.8rem;
-            font-weight: 700;
-            margin-bottom: 0.2rem;
-        }
-
-        .metric-subtext {
-            font-size: 0.8rem;
-            color: var(--text-muted);
-        }
-
-        /* Colored metrics */
-        .val-positive {
-            color: var(--success);
-        }
-
-        .val-negative {
-            color: var(--danger);
-        }
+        {{ shared_css }}
 
         /* Charts Layout */
         .grid-charts {
@@ -710,52 +773,8 @@ class ReportGenerator:
             box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.3);
         }
 
-        /* Table Style */
         .table-container {
-            background: var(--card-bg);
-            border: 1px solid var(--border-color);
-            border-radius: 16px;
-            padding: 1.5rem;
             margin-top: 2rem;
-            overflow-x: auto;
-            box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.3);
-        }
-
-        .table-container h3 {
-            font-family: 'Outfit', sans-serif;
-            font-size: 1.3rem;
-            margin-bottom: 1.2rem;
-            color: var(--text-main);
-            border-left: 4px solid var(--primary);
-            padding-left: 0.75rem;
-        }
-
-        table {
-            width: 100%;
-            border-collapse: collapse;
-            text-align: left;
-            font-size: 0.9rem;
-        }
-
-        th {
-            color: var(--text-muted);
-            font-weight: 600;
-            padding: 0.75rem 1rem;
-            border-bottom: 1px solid var(--border-color);
-            text-transform: uppercase;
-            font-size: 0.8rem;
-            letter-spacing: 0.05em;
-        }
-
-        td {
-            padding: 0.85rem 1rem;
-            border-bottom: 1px solid rgba(255,255,255,0.03);
-            color: #d1d5db;
-        }
-
-        tr:hover td {
-            background: rgba(255, 255, 255, 0.02);
-            color: var(--text-main);
         }
 
         .badge-buy {
@@ -937,7 +956,7 @@ class ReportGenerator:
     """)
 
     # Jinja2 HTML template with premium design styling for optimization results
-    HTML_OPTIMIZATION_TEMPLATE = jinja2.Template("""
+    HTML_OPTIMIZATION_TEMPLATE = _JINJA_ENV.from_string("""
 <!DOCTYPE html>
 <html lang="vi">
 <head>
@@ -951,127 +970,7 @@ class ReportGenerator:
     <!-- Include Plotly JS CDN -->
     <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
     <style>
-        :root {
-            --bg-color: #0b0f19;
-            --card-bg: rgba(17, 25, 40, 0.75);
-            --border-color: rgba(255, 255, 255, 0.08);
-            --primary: #00ffcc;
-            --primary-hover: #00cc99;
-            --text-main: #f3f4f6;
-            --text-muted: #9ca3af;
-            --success: #10b981;
-            --danger: #ef4444;
-            --warning: #f59e0b;
-        }
-
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-
-        body {
-            font-family: 'Inter', sans-serif;
-            background-color: var(--bg-color);
-            color: var(--text-main);
-            line-height: 1.6;
-            padding: 2rem 1.5rem;
-        }
-
-        .container {
-            max-width: 1400px;
-            margin: 0 auto;
-        }
-
-        /* Header Style */
-        header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 2.5rem;
-            padding-bottom: 1.5rem;
-            border-bottom: 1px solid var(--border-color);
-        }
-
-        .header-title h1 {
-            font-family: 'Outfit', sans-serif;
-            font-size: 2.2rem;
-            font-weight: 800;
-            background: linear-gradient(135deg, #00ffcc 0%, #3b82f6 100%);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            margin-bottom: 0.3rem;
-        }
-
-        .header-title p {
-            color: var(--text-muted);
-            font-size: 1rem;
-        }
-
-        .badge {
-            background: rgba(0, 255, 204, 0.15);
-            color: var(--primary);
-            padding: 0.4rem 1rem;
-            border-radius: 50px;
-            font-size: 0.85rem;
-            font-weight: 600;
-            border: 1px solid rgba(0, 255, 204, 0.3);
-            text-transform: uppercase;
-        }
-
-        /* Glassmorphism Card Layout */
-        .grid-metrics {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
-            gap: 1.25rem;
-            margin-bottom: 2.5rem;
-        }
-
-        .card {
-            background: var(--card-bg);
-            border: 1px solid var(--border-color);
-            border-radius: 16px;
-            padding: 1.5rem;
-            box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.3);
-            backdrop-filter: blur(10px);
-            -webkit-backdrop-filter: blur(10px);
-            transition: transform 0.2s, border-color 0.2s;
-        }
-
-        .card:hover {
-            transform: translateY(-3px);
-            border-color: rgba(0, 255, 204, 0.25);
-        }
-
-        .metric-label {
-            color: var(--text-muted);
-            font-size: 0.85rem;
-            font-weight: 500;
-            margin-bottom: 0.5rem;
-            text-transform: uppercase;
-            letter-spacing: 0.05em;
-        }
-
-        .metric-value {
-            font-family: 'Outfit', sans-serif;
-            font-size: 1.6rem;
-            font-weight: 700;
-            margin-bottom: 0.2rem;
-        }
-
-        .metric-subtext {
-            font-size: 0.8rem;
-            color: var(--text-muted);
-        }
-
-        /* Colored metrics */
-        .val-positive {
-            color: var(--success);
-        }
-
-        .val-negative {
-            color: var(--danger);
-        }
+        {{ shared_css }}
 
         .best-params-badge {
             background: rgba(0, 255, 204, 0.1);
@@ -1093,53 +992,6 @@ class ReportGenerator:
             padding: 1.5rem;
             box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.3);
             margin-bottom: 2.5rem;
-        }
-
-        /* Table Style */
-        .table-container {
-            background: var(--card-bg);
-            border: 1px solid var(--border-color);
-            border-radius: 16px;
-            padding: 1.5rem;
-            overflow-x: auto;
-            box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.3);
-        }
-
-        .table-container h3 {
-            font-family: 'Outfit', sans-serif;
-            font-size: 1.3rem;
-            margin-bottom: 1.2rem;
-            color: var(--text-main);
-            border-left: 4px solid var(--primary);
-            padding-left: 0.75rem;
-        }
-
-        table {
-            width: 100%;
-            border-collapse: collapse;
-            text-align: left;
-            font-size: 0.9rem;
-        }
-
-        th {
-            color: var(--text-muted);
-            font-weight: 600;
-            padding: 0.75rem 1rem;
-            border-bottom: 1px solid var(--border-color);
-            text-transform: uppercase;
-            font-size: 0.8rem;
-            letter-spacing: 0.05em;
-        }
-
-        td {
-            padding: 0.85rem 1rem;
-            border-bottom: 1px solid rgba(255,255,255,0.03);
-            color: #d1d5db;
-        }
-
-        tr:hover td {
-            background: rgba(255, 255, 255, 0.02);
-            color: var(--text-main);
         }
     </style>
 </head>
@@ -1166,8 +1018,8 @@ class ReportGenerator:
             
             <div class="card">
                 <div class="metric-label">Tổng Lợi Nhuận (Best)</div>
-                <div class="metric-value val-positive">
-                    +{{ (best.total_return * 100) | round(2) }}%
+                <div class="metric-value {% if best.total_return >= 0 %}val-positive{% else %}val-negative{% endif %}">
+                    {% if best.total_return >= 0 %}+{% endif %}{{ (best.total_return * 100) | round(2) }}%
                 </div>
                 <div class="metric-subtext">CAGR: {{ (best.cagr * 100) | round(2) }}%</div>
             </div>

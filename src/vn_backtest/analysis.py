@@ -34,12 +34,15 @@ class PerformanceAnalyzer:
         if equity_curve.empty:
             return {}
 
-        final_equity = equity_curve["Equity"].iloc[-1]
+        # BUG FIX: Work on a copy to avoid mutating the caller's DataFrame in-place.
+        equity_df = equity_curve.copy()
+
+        final_equity = equity_df["Equity"].iloc[-1]
         total_return = (final_equity - initial_cash) / initial_cash
 
         # Calculate calendar duration
-        start_date = equity_curve.index[0]
-        end_date = equity_curve.index[-1]
+        start_date = equity_df.index[0]
+        end_date = equity_df.index[-1]
         duration_days = (end_date - start_date).days
         years = duration_days / 365.25
 
@@ -51,9 +54,9 @@ class PerformanceAnalyzer:
         else:
             cagr = 0.0
 
-        # Daily Returns
-        equity_curve["DailyReturn"] = equity_curve["Equity"].pct_change().fillna(0.0)
-        daily_returns = equity_curve["DailyReturn"]
+        # Daily Returns (computed on the copy, never touching the original)
+        equity_df["DailyReturn"] = equity_df["Equity"].pct_change().fillna(0.0)
+        daily_returns = equity_df["DailyReturn"]
 
         # Volatility (Annualized)
         daily_vol = daily_returns.std()
@@ -75,8 +78,8 @@ class PerformanceAnalyzer:
             sortino_ratio = 0.0
 
         # Drawdowns
-        running_max = equity_curve["Equity"].cummax()
-        drawdown = (equity_curve["Equity"] - running_max) / running_max
+        running_max = equity_df["Equity"].cummax()
+        drawdown = (equity_df["Equity"] - running_max) / running_max
         max_drawdown = drawdown.min()
 
         # Drawdown Duration (in trading days)
@@ -95,13 +98,14 @@ class PerformanceAnalyzer:
                 | (trades["Note"] != "Auto-closed at end of backtest")
             ]
 
-        # Count only BUY and SELL for trade count statistics
+        # Count BUY and SELL orders (raw order count — separate from round-trip count)
         actual_buy_sells = pd.DataFrame(columns=trades.columns)
         if not strategy_trades.empty:
             actual_buy_sells = strategy_trades[
                 strategy_trades["Action"].isin(["BUY", "SELL"])
             ]
-        total_trades = len(actual_buy_sells)
+        total_orders = len(actual_buy_sells)
+        total_trades = 0  # Will be set to n_completed after FIFO matching
 
         win_rate = 0.0
         profit_factor = 0.0
@@ -110,7 +114,7 @@ class PerformanceAnalyzer:
         worst_trade = 0.0
         avg_hold_days = 0.0
 
-        if total_trades > 0:
+        if total_orders > 0:
             # Filter for trade matching (BUY, SELL, DIVIDEND_STOCK, and DIVIDEND_CASH)
             matching_trades = pd.DataFrame(columns=trades.columns)
             if not strategy_trades.empty:
@@ -256,6 +260,11 @@ class PerformanceAnalyzer:
 
             # Calculate stats from completed trades
             n_completed = len(completed_trades)
+            
+            # BUG FIX: total_trades should be the number of completed round-trips
+            # (BUY→SELL pairs), not the raw count of BUY + SELL orders.
+            total_trades = n_completed
+            
             if n_completed > 0:
                 trade_returns = [tc["return"] for tc in completed_trades]
                 trade_profits = [tc["profit"] for tc in completed_trades]
@@ -286,7 +295,7 @@ class PerformanceAnalyzer:
 
         if benchmark_data is not None and not benchmark_data.empty:
             # Align dates
-            aligned_data = pd.DataFrame(index=equity_curve.index)
+            aligned_data = pd.DataFrame(index=equity_df.index)
             aligned_data["Strategy_Return"] = daily_returns
 
             # Map benchmark Close to aligned index
@@ -298,23 +307,37 @@ class PerformanceAnalyzer:
                 else bench_close.index
             )
             strategy_index = (
-                equity_curve.index.tz_localize(None)
-                if equity_curve.index.tz is not None
-                else equity_curve.index
+                equity_df.index.tz_localize(None)
+                if equity_df.index.tz is not None
+                else equity_df.index
             )
 
-            bench_close_aligned = bench_close.reindex(strategy_index).ffill().bfill()
+            # PERF FIX: Avoid bfill() which introduces lookahead bias. Only use ffill().
+            bench_close_aligned = bench_close.reindex(strategy_index).ffill()
+            if bench_close_aligned.isna().any():
+                import logging
+                logging.warning(
+                    "Dữ liệu benchmark có giá trị NaN ở các ngày đầu của backtest. "
+                    "Chiến lược bắt đầu trước khi có dữ liệu benchmark; "
+                    "các ngày này sẽ bị loại khỏi tính toán Alpha/Beta."
+                )
             aligned_data["Benchmark_Close"] = bench_close_aligned
             aligned_data["Benchmark_Return"] = (
                 aligned_data["Benchmark_Close"].pct_change().fillna(0.0)
             )
 
-            # Benchmark total return
-            bench_start = aligned_data["Benchmark_Close"].iloc[0]
-            bench_end = aligned_data["Benchmark_Close"].iloc[-1]
-            benchmark_return = (
-                (bench_end - bench_start) / bench_start if bench_start > 0 else 0.0
-            )
+            # Benchmark total return (calculated from the first valid price)
+            bench_valid = aligned_data["Benchmark_Close"].dropna()
+            if not bench_valid.empty:
+                bench_start = bench_valid.iloc[0]
+                bench_end = bench_valid.iloc[-1]
+                benchmark_return = (
+                    (bench_end - bench_start) / bench_start if bench_start > 0 else 0.0
+                )
+            else:
+                bench_start = 0.0
+                bench_end = 0.0
+                benchmark_return = 0.0
 
             # Benchmark CAGR
             if years > 0 and bench_end > 0 and bench_start > 0:
@@ -354,7 +377,8 @@ class PerformanceAnalyzer:
             "sortino_ratio": sortino_ratio,
             "max_drawdown": max_drawdown,
             "max_drawdown_duration": max_dd_duration,
-            "total_trades": total_trades,
+            "total_trades": total_trades,   # Số round-trips hoàn chỉnh (BUY→SELL)
+            "total_orders": total_orders,    # Tổng số lệnh BUY + SELL (raw order count)
             "win_rate": win_rate,
             "profit_factor": profit_factor,
             "avg_trade_return": avg_trade_return,

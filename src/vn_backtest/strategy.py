@@ -32,105 +32,80 @@ class Strategy:
             return self.engine.dates[self.current_idx]
         return self.data.index[self.current_idx]
 
+    # ────────────────────────────────────────────────────────
+    # OHLCV Accessors
+    # ────────────────────────────────────────────────────────
+
+    def _get_field(self, field: str, ticker: str = None) -> float:
+        """
+        Unified OHLCV data accessor. Used by all @property shortcuts and get_xxx() methods.
+
+        Resolves data in priority order:
+          1. If ticker given (or resolvable): df.loc[current_time, field] for the ticker.
+          2. Fallback (single-DataFrame mode): df[field].iloc[current_idx].
+
+        Returns float('nan') when the current_time is not in the ticker's index
+        (e.g. the stock was not traded on that day).
+        """
+        if ticker is None:
+            ticker = getattr(
+                self.engine,
+                "main_ticker",
+                list(self.data.keys())[0] if isinstance(self.data, dict) else None,
+            )
+        if ticker is not None:
+            df = self.data[ticker] if isinstance(self.data, dict) else self.data
+            current_time = self.current_time
+            if current_time in df.index:
+                return float(df.loc[current_time, field])
+            return float("nan")
+        # Fallback: single-DataFrame mode without a named ticker
+        return float(self.data[field].iloc[self.current_idx])
+
     @property
     def open(self) -> float:
         """Get the Open price of the current bar for the main ticker."""
-        ticker = getattr(
-            self.engine,
-            "main_ticker",
-            list(self.data.keys())[0] if isinstance(self.data, dict) else None,
-        )
-        if ticker:
-            return self.get_open(ticker)
-        return float(self.data["Open"].iloc[self.current_idx])
+        return self._get_field("Open")
 
     @property
     def high(self) -> float:
         """Get the High price of the current bar for the main ticker."""
-        ticker = getattr(
-            self.engine,
-            "main_ticker",
-            list(self.data.keys())[0] if isinstance(self.data, dict) else None,
-        )
-        if ticker:
-            return self.get_high(ticker)
-        return float(self.data["High"].iloc[self.current_idx])
+        return self._get_field("High")
 
     @property
     def low(self) -> float:
         """Get the Low price of the current bar for the main ticker."""
-        ticker = getattr(
-            self.engine,
-            "main_ticker",
-            list(self.data.keys())[0] if isinstance(self.data, dict) else None,
-        )
-        if ticker:
-            return self.get_low(ticker)
-        return float(self.data["Low"].iloc[self.current_idx])
+        return self._get_field("Low")
 
     @property
     def close(self) -> float:
         """Get the Close price of the current bar for the main ticker."""
-        ticker = getattr(
-            self.engine,
-            "main_ticker",
-            list(self.data.keys())[0] if isinstance(self.data, dict) else None,
-        )
-        if ticker:
-            return self.get_close(ticker)
-        return float(self.data["Close"].iloc[self.current_idx])
+        return self._get_field("Close")
 
     @property
     def volume(self) -> float:
         """Get the Volume of the current bar for the main ticker."""
-        ticker = getattr(
-            self.engine,
-            "main_ticker",
-            list(self.data.keys())[0] if isinstance(self.data, dict) else None,
-        )
-        if ticker:
-            return self.get_volume(ticker)
-        return float(self.data["Volume"].iloc[self.current_idx])
+        return self._get_field("Volume")
 
     def get_open(self, ticker: str) -> float:
         """Get Open price of a specific ticker today."""
-        df = self.data[ticker] if isinstance(self.data, dict) else self.data
-        current_time = self.current_time
-        if current_time in df.index:
-            return float(df.loc[current_time, "Open"])
-        return float("nan")
+        return self._get_field("Open", ticker)
 
     def get_high(self, ticker: str) -> float:
         """Get High price of a specific ticker today."""
-        df = self.data[ticker] if isinstance(self.data, dict) else self.data
-        current_time = self.current_time
-        if current_time in df.index:
-            return float(df.loc[current_time, "High"])
-        return float("nan")
+        return self._get_field("High", ticker)
 
     def get_low(self, ticker: str) -> float:
         """Get Low price of a specific ticker today."""
-        df = self.data[ticker] if isinstance(self.data, dict) else self.data
-        current_time = self.current_time
-        if current_time in df.index:
-            return float(df.loc[current_time, "Low"])
-        return float("nan")
+        return self._get_field("Low", ticker)
 
     def get_close(self, ticker: str) -> float:
         """Get Close price of a specific ticker today."""
-        df = self.data[ticker] if isinstance(self.data, dict) else self.data
-        current_time = self.current_time
-        if current_time in df.index:
-            return float(df.loc[current_time, "Close"])
-        return float("nan")
+        return self._get_field("Close", ticker)
 
     def get_volume(self, ticker: str) -> float:
         """Get Volume of a specific ticker today."""
-        df = self.data[ticker] if isinstance(self.data, dict) else self.data
-        current_time = self.current_time
-        if current_time in df.index:
-            return float(df.loc[current_time, "Volume"])
-        return float("nan")
+        return self._get_field("Volume", ticker)
 
     @property
     def cash(self) -> float:
@@ -228,7 +203,7 @@ class Strategy:
             ticker, target_percent, time=self.current_time
         )
 
-    def I(self, func: Callable[..., pd.Series], *args, **kwargs) -> pd.Series:
+    def I(self, func: Callable[..., pd.Series], *args, ticker: str = None, **kwargs) -> pd.Series:
         """
         Khai báo và tính toán một chỉ báo (Indicator) trên toàn bộ tập dữ liệu.
         Phương thức này tính toán theo cơ chế Vectorization (tính 1 lần ở init)
@@ -243,57 +218,53 @@ class Strategy:
         Args:
             func: Hàm tính toán chỉ báo (ví dụ: ta.trend.sma_indicator)
             *args: Các tham số vị trí truyền vào func
+            ticker: Mã cổ phiếu cụ thể để tính chỉ báo (tùy chọn)
             **kwargs: Các tham số từ khóa truyền vào func
 
         Returns:
             pd.Series: Chuỗi giá trị của chỉ báo.
         """
-        if (
-            args
-            and isinstance(args[0], str)
-            and isinstance(self.data, dict)
-            and args[0] in self.data
-        ):
+        # Xác định ticker và tham số truyền vào hàm
+        if ticker is None and args and isinstance(args[0], str) and isinstance(self.data, dict) and args[0] in self.data:
             ticker = args[0]
             func_args = args[1:]
-            df = self.data[ticker]
-        else:
+        elif ticker is None:
             if isinstance(self.data, dict):
                 ticker = getattr(self.engine, "main_ticker", list(self.data.keys())[0])
-                df = self.data[ticker]
             else:
-                df = self.data
+                ticker = None
+            func_args = args
+        else:
             func_args = args
 
-        # Redirect indicators from Close to Adj_Close if adjusted price columns are available
-        if "Adj_Close" in df.columns:
-            import inspect
+        df = self.data[ticker] if ticker and isinstance(self.data, dict) else self.data
 
+        # Redirect indicators from Close to Adj_Close if adjusted price columns are available
+        if "Adj_Close" in df.columns and "column" not in kwargs:
             try:
+                import inspect
                 sig = inspect.signature(func)
                 if "column" in sig.parameters:
-                    if "column" in kwargs:
-                        if kwargs["column"] == "Close":
-                            kwargs["column"] = "Adj_Close"
-                            logger.debug("Tự động chuyển nguồn dữ liệu chỉ báo sang cột 'Adj_Close'.")
-                    else:
-                        param_names = list(sig.parameters.keys())
-                        col_idx = (
-                            param_names.index("column") - 1
-                        )  # skip first arg (data)
-                        if len(func_args) <= col_idx:
-                            kwargs["column"] = "Adj_Close"
-                            logger.debug("Tự động chuyển nguồn dữ liệu chỉ báo sang cột 'Adj_Close'.")
-            except Exception:
-                if "column" in kwargs:
-                    if kwargs["column"] == "Close":
+                    param_names = list(sig.parameters.keys())
+                    col_idx = param_names.index("column") - 1  # skip first arg (df)
+                    if len(func_args) <= col_idx:
                         kwargs["column"] = "Adj_Close"
-                elif len(func_args) < 2:
+                        logger.debug("Tự động chuyển nguồn dữ liệu chỉ báo sang cột 'Adj_Close'.")
+            except Exception:
+                if len(func_args) < 2:
                     kwargs["column"] = "Adj_Close"
+        elif "Adj_Close" in df.columns and "column" in kwargs:
+            if kwargs["column"] == "Close":
+                kwargs["column"] = "Adj_Close"
+                logger.debug("Tự động chuyển nguồn dữ liệu chỉ báo sang cột 'Adj_Close'.")
 
         indicator_series = func(df, *func_args, **kwargs)
 
-        # Khuyến nghị: Có thể chèn thêm logic kiểm tra NaN ở cuối chuỗi để cảnh báo lookahead bias
-        # (Chỉ báo dùng dữ liệu tương lai thường sẽ bị NaN ở các dòng cuối).
+        if not isinstance(indicator_series, pd.Series):
+            raise TypeError(
+                f"Hàm indicator '{func.__name__ if hasattr(func, '__name__') else str(func)}' phải trả về pd.Series, "
+                f"nhưng đã trả về {type(indicator_series).__name__}."
+            )
+
         self._indicators.append(indicator_series)
         return indicator_series

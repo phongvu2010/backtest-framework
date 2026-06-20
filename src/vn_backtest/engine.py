@@ -4,6 +4,7 @@ import numpy as np
 from typing import Type, Union, List, Dict, Any
 from collections import deque
 from .strategy import Strategy
+from .trading_rules import TradingRulesManager
 
 logger = logging.getLogger(__name__)
 
@@ -170,6 +171,15 @@ class BacktestEngine:
             if not valid_df.empty:
                 self.raw_listing_dates[ticker] = valid_df.index[0]
 
+        # Initialize TradingRulesManager
+        self.rules = TradingRulesManager(
+            dynamic_rules=self.dynamic_rules,
+            default_lot_size=self.default_lot_size,
+            default_allow_odd_lot=self.default_allow_odd_lot,
+            exchanges=self.exchanges,
+            raw_listing_dates=self.raw_listing_dates
+        )
+
         # Reindex and fill data to prevent multi-ticker timeline alignment issues
         self._reindex_and_fill_data()
 
@@ -246,31 +256,7 @@ class BacktestEngine:
         self, price: float, exchange: str, current_time: pd.Timestamp = None
     ) -> float:
         """Get the tick size for a given price according to exchange rules."""
-        price = float(price)
-        if exchange == "hose":
-            if (
-                self.dynamic_rules
-                and current_time is not None
-                and current_time < pd.Timestamp("2016-09-12")
-            ):
-                # HOSE rules before 12/09/2016
-                if price < 50000.0:
-                    return 100.0
-                elif price < 100000.0:
-                    return 500.0
-                else:
-                    return 1000.0
-            else:
-                # HOSE rules from 12/09/2016 onwards
-                if price < 10000.0:
-                    return 10.0
-                elif price < 50000.0:
-                    return 50.0
-                else:
-                    return 100.0
-        else:
-            # HNX and UPCOM use 100 VND tick size for all stocks
-            return 100.0
+        return self.rules.get_tick_size(price, exchange, current_time)
 
     def _round_to_tick(
         self,
@@ -279,21 +265,8 @@ class BacktestEngine:
         direction: str,
         current_time: pd.Timestamp = None,
     ) -> float:
-        """
-        Round a price to the nearest tick size according to Vietnam exchange rules.
-        Ceiling prices are rounded DOWN to the nearest tick to not exceed the limit.
-        Floor prices are rounded UP to the nearest tick.
-        HOSE uses historical tick sizes if dynamic rules are enabled.
-        """
-        price = float(price)
-        tick = self._get_tick_size(price, exchange, current_time)
-
-        if direction == "down":  # Ceiling
-            return (price // tick) * tick
-        elif direction == "up":  # Floor
-            return np.ceil(price / tick) * tick
-        else:
-            return round(price / tick) * tick
+        """Round a price to the nearest tick size according to Vietnam exchange rules."""
+        return self.rules.round_to_tick(price, exchange, direction, current_time)
 
     def _check_price_limits(
         self,
@@ -303,108 +276,20 @@ class BacktestEngine:
         price_limit: float,
         current_time: pd.Timestamp = None,
     ) -> tuple[float, float, bool, bool]:
-        """
-        Calculate ceiling and floor prices and check if execution price hits them.
-        Returns: (ceiling, floor, is_ceiling, is_floor)
-        """
-        if prev_close is None or price_limit == 0.0:
-            return float("inf"), 0.0, False, False
-
-        # Calculate limits
-        raw_ceiling = prev_close * (1 + price_limit)
-        raw_floor = prev_close * (1 - price_limit)
-
-        ceiling = self._round_to_tick(raw_ceiling, exchange, "down", current_time)
-        floor = self._round_to_tick(raw_floor, exchange, "up", current_time)
-
-        is_ceiling = price >= ceiling
-        is_floor = price <= floor
-
-        return ceiling, floor, is_ceiling, is_floor
+        """Calculate ceiling and floor prices and check if execution price hits them."""
+        return self.rules.check_price_limits(price, prev_close, exchange, price_limit, current_time)
 
     def _get_lot_size(self, ticker: str, current_time: pd.Timestamp) -> int:
         """Get the lot size dynamically based on time and exchange rules."""
-        if not self.dynamic_rules:
-            return self.default_lot_size
-
-        exch = self.exchanges.get(ticker, "hose")
-        if exch == "hose":
-            if current_time < pd.Timestamp("2021-01-04"):
-                return 10
-            else:
-                return 100
-        else:
-            return 100
+        return self.rules.get_lot_size(ticker, current_time)
 
     def _is_odd_lot_allowed(self, ticker: str, current_time: pd.Timestamp) -> bool:
         """Determine if odd-lot trading (1-99 shares) is allowed for a stock today."""
-        if not self.dynamic_rules:
-            return self.default_allow_odd_lot
-        exch = self.exchanges.get(ticker, "hose")
-        if exch == "hose":
-            return current_time >= pd.Timestamp("2022-09-12")
-        return True
+        return self.rules.is_odd_lot_allowed(ticker, current_time)
 
     def _get_price_limit(self, ticker: str, current_time: pd.Timestamp) -> float:
         """Get the daily price limit percentage for a stock based on date and listing status."""
-        exch = self.exchanges.get(ticker, "hose")
-
-        # Check if today is the listing day
-        is_listing_day = False
-        if hasattr(self, "raw_listing_dates") and ticker in self.raw_listing_dates:
-            if current_time.normalize() == self.raw_listing_dates[ticker].normalize():
-                is_listing_day = True
-
-        if is_listing_day:
-            if exch == "hose":
-                return 0.20
-            elif exch == "hnx":
-                return 0.30
-            elif exch == "upcom":
-                return 0.40
-            return 0.0
-
-        # Normal trading day - historical limits
-        if exch == "hose":
-            if current_time < pd.Timestamp("2000-08-24"):
-                return 0.02
-            elif current_time < pd.Timestamp("2001-06-13"):
-                return 0.05
-            elif current_time < pd.Timestamp("2002-08-01"):
-                return 0.02
-            elif current_time < pd.Timestamp("2003-01-02"):
-                return 0.03
-            elif current_time < pd.Timestamp("2008-03-27"):
-                return 0.05
-            elif current_time < pd.Timestamp("2008-04-07"):
-                return 0.01
-            elif current_time < pd.Timestamp("2008-06-19"):
-                return 0.02
-            elif current_time < pd.Timestamp("2008-08-18"):
-                return 0.03
-            elif current_time < pd.Timestamp("2013-01-15"):
-                return 0.05
-            else:
-                return 0.07
-        elif exch == "hnx":
-            if current_time < pd.Timestamp("2008-03-27"):
-                return 0.10
-            elif current_time < pd.Timestamp("2008-04-07"):
-                return 0.02
-            elif current_time < pd.Timestamp("2008-06-19"):
-                return 0.03
-            elif current_time < pd.Timestamp("2008-08-18"):
-                return 0.05
-            elif current_time < pd.Timestamp("2013-01-15"):
-                return 0.07
-            else:
-                return 0.10
-        elif exch == "upcom":
-            if current_time < pd.Timestamp("2015-07-01"):
-                return 0.10
-            else:
-                return 0.15
-        return 0.0
+        return self.rules.get_price_limit(ticker, current_time)
 
     def _process_settlements(self, current_idx: int):
         """Move shares from locked to sellable once they reach their settlement index."""
@@ -779,16 +664,7 @@ class BacktestEngine:
 
     def _apply_dynamic_rules(self, current_time: pd.Timestamp):
         """Apply VN historical trading rules based on the date."""
-        # Quy tắc chu kỳ thanh toán lịch sử Việt Nam:
-        if current_time < pd.Timestamp("2016-01-01"):
-            self.settlement_days = 4  # Settle cuối ngày T+3 -> Giao dịch từ T+4
-        elif current_time < pd.Timestamp("2022-08-29"):
-            self.settlement_days = 3  # Settle cuối ngày T+2 -> Giao dịch từ T+3
-        else:  # Từ 29/08/2022 (T+1.5)
-            if self.execution_at == "close":
-                self.settlement_days = 2  # Settle 13:00 T+2 -> Giao dịch được Close T+2
-            else:
-                self.settlement_days = 3  # Giao dịch được Open T+3
+        self.settlement_days = self.rules.apply_dynamic_rules(current_time, self.execution_at)
 
     def _detect_if_adjusted(self) -> bool:
         """
@@ -952,6 +828,28 @@ class BacktestEngine:
 
         n_bars = len(self.dates)
 
+        # Pre-compute previous-bar reference prices and close prices to avoid
+        # O(N²) DataFrame slicing (`ticker_df[:current_time]`) inside the loop.
+        self._prev_ref_cache: Dict[str, pd.Series] = {}
+        self._prev_close_cache: Dict[str, pd.Series] = {}
+        for ticker, ticker_df in self.data.items():
+            exch = self.exchanges.get(ticker, "hose")
+            if exch == "upcom":
+                if "Average" in ticker_df.columns:
+                    ref = ticker_df["Average"].where(
+                        ticker_df["Average"].notna() & (ticker_df["Average"] > 0),
+                        (ticker_df["Open"] + ticker_df["High"] + ticker_df["Low"] + ticker_df["Close"]) / 4.0,
+                    )
+                else:
+                    ref = (
+                        ticker_df["Open"] + ticker_df["High"]
+                        + ticker_df["Low"] + ticker_df["Close"]
+                    ) / 4.0
+            else:
+                ref = ticker_df["Close"]
+            self._prev_ref_cache[ticker] = ref.shift(1)
+            self._prev_close_cache[ticker] = ticker_df["Close"].shift(1)
+
         # Main simulation loop
         for idx in range(n_bars):
             strategy.current_idx = idx
@@ -1065,51 +963,27 @@ class BacktestEngine:
 
             # 3. Execute pending orders placed on previous day
             # Reference prices for limits are the Close of previous day (or Weighted Average for UPCoM)
+            # PERF: O(1) lookup using precomputed shifted reference prices cache
             prev_closes = {}
             for ticker in self.data:
-                ticker_df = self.data[ticker]
-                exch = self.exchanges.get(ticker, "hose")
-                past_df = ticker_df[:current_time]
-
-                prev_row = None
-                if len(past_df) > 1:
-                    if current_time in ticker_df.index:
-                        prev_row = past_df.iloc[-2]
-                    else:
-                        prev_row = past_df.iloc[-1]
-                elif len(past_df) == 1 and current_time not in ticker_df.index:
-                    prev_row = past_df.iloc[-1]
-
-                if prev_row is not None:
-                    if exch == "upcom":
-                        if "Average" in prev_row and pd.notna(prev_row["Average"]):
-                            prev_closes[ticker] = prev_row["Average"]
-                        else:
-                            # Estimate UPCoM reference price as typical price (Open+High+Low+Close)/4
-                            prev_closes[ticker] = (
-                                prev_row["Open"]
-                                + prev_row["High"]
-                                + prev_row["Low"]
-                                + prev_row["Close"]
-                            ) / 4.0
-                    else:
-                        prev_closes[ticker] = prev_row["Close"]
+                cached_val = self._prev_ref_cache[ticker].get(current_time)
+                if cached_val is not None and not pd.isna(cached_val):
+                    prev_closes[ticker] = float(cached_val)
                 else:
                     prev_closes[ticker] = None
 
             self._execute_orders(current_time, prev_closes, idx)
 
             # 4. Calculate portfolio equity at current Close
+            # PERF: O(1) lookup using precomputed shifted close prices cache for valuation fallback
             positions_value = 0.0
             for ticker, qty in self.positions.items():
                 ticker_df = self.data[ticker]
                 if current_time in ticker_df.index:
                     close_price = ticker_df.loc[current_time, "Close"]
                 else:
-                    past_df = ticker_df[:current_time]
-                    close_price = (
-                        past_df.iloc[-1]["Close"] if not past_df.empty else 0.0
-                    )
+                    close_val = self._prev_close_cache[ticker].get(current_time, 0.0) or 0.0
+                    close_price = 0.0 if pd.isna(close_val) else float(close_val)
                 positions_value += qty * close_price
 
             equity = self.cash + positions_value
@@ -1179,10 +1053,8 @@ class BacktestEngine:
                         if current_time in ticker_df.index:
                             close_price = ticker_df.loc[current_time, "Close"]
                         else:
-                            past_df = ticker_df[:current_time]
-                            close_price = (
-                                past_df.iloc[-1]["Close"] if not past_df.empty else 0.0
-                            )
+                            close_val = self._prev_close_cache[ticker].get(current_time, 0.0) or 0.0
+                            close_price = 0.0 if pd.isna(close_val) else float(close_val)
 
                         if close_price > 0:
                             qty_to_sell = qty * (value_to_sell / positions_value)
@@ -1330,6 +1202,11 @@ class BacktestEngine:
         )
 
         for order in sorted_orders:
+            # Skip executing orders placed on the current bar (they will execute on the next bar)
+            if order.get("time_placed") == current_time:
+                self.pending_orders.append(order)
+                continue
+
             ticker = order["ticker"]
             action = order["action"]
             qty = order["quantity"]
@@ -1964,8 +1841,8 @@ class BacktestEngine:
             if current_time in ticker_df.index:
                 close_price = ticker_df.loc[current_time, "Close"]
             else:
-                past_df = ticker_df[:current_time]
-                close_price = past_df.iloc[-1]["Close"] if not past_df.empty else None
+                close_val = self._prev_close_cache[ticker].get(current_time)
+                close_price = None if pd.isna(close_val) else float(close_val)
 
             if close_price is None or pd.isna(close_price) or close_price <= 0:
                 # Cannot size order without price, reject it
@@ -1993,8 +1870,8 @@ class BacktestEngine:
                 if current_time in t_df.index:
                     c_price = t_df.loc[current_time, "Close"]
                 else:
-                    past_t = t_df[:current_time]
-                    c_price = past_t.iloc[-1]["Close"] if not past_t.empty else 0.0
+                    c_val = self._prev_close_cache[t].get(current_time, 0.0) or 0.0
+                    c_price = 0.0 if pd.isna(c_val) else float(c_val)
                 positions_value += qty * c_price
             equity = self.cash + positions_value
 
@@ -2228,6 +2105,20 @@ class BacktestEngine:
                     trade_value = qty_to_sell * trigger_price
                     fee = trade_value * self.sell_fee
                     tax = trade_value * self.sell_tax
+
+                    # Apply 5% personal income tax (TNCN) on selling stock dividends under Decree 126
+                    div_tax = 0.0
+                    div_qty = self.dividend_shares.get(ticker, 0)
+                    sold_from_div = min(qty_to_sell, div_qty)
+                    if sold_from_div > 0:
+                        self.dividend_shares[ticker] = div_qty - sold_from_div
+                        div_tax = (
+                            sold_from_div
+                            * min(trigger_price, 10000.0)
+                            * self.dividend_tax_rate
+                        )
+                        tax += div_tax
+
                     net_proceeds = trade_value - fee - tax
 
                     self.cash += net_proceeds
@@ -2252,6 +2143,8 @@ class BacktestEngine:
                             del self.position_entry_price[ticker]
                         if ticker in self.position_highest_price:
                             del self.position_highest_price[ticker]
+                        if ticker in self.dividend_shares:
+                            del self.dividend_shares[ticker]
 
                     if (
                         ticker in self.sellable_shares
