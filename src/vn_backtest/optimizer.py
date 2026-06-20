@@ -228,3 +228,125 @@ class ParameterOptimizer:
         print("=" * 60 + "\n")
 
         return results_df
+
+    def run_optuna(
+        self,
+        n_trials: int = 50,
+        sort_by: str = "sharpe_ratio",
+        ascending: bool = False,
+        sampler: str = "tpe",
+    ) -> pd.DataFrame:
+        """
+        Run parameter optimization using Optuna's Bayesian optimization.
+
+        Args:
+            n_trials (int): Number of optimization trials to run.
+            sort_by (str): Metric to maximize/minimize.
+            ascending (bool): If True, minimize. If False, maximize.
+            sampler (str): Sampler type ('tpe' or 'random').
+
+        Returns:
+            pd.DataFrame: Optimization results with parameters and metrics.
+        """
+        try:
+            import optuna
+        except ImportError:
+            raise ImportError(
+                "Thư viện 'optuna' chưa được cài đặt. Vui lòng cài đặt bằng lệnh:\n"
+                "pip install optuna"
+            )
+
+        print("=" * 60)
+        logger.info(f"KHỞI CHẠY TỐI ƯU HÓA OPTUNA (Số lượt chạy thử nghiệm: {n_trials})")
+        print("=" * 60)
+
+        # Optuna logging level
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+        # Objective function
+        def objective(trial):
+            # Suggest parameters
+            params = {}
+            for param_name, values in self.param_grid.items():
+                params[param_name] = trial.suggest_categorical(param_name, values)
+
+            # Run backtest
+            task_args = (
+                trial.number,
+                params,
+                self.data,
+                self.strategy_class,
+                self.initial_cash,
+                self.exchange,
+                self.benchmark_data,
+                self.risk_free_rate,
+                self.engine_kwargs,
+            )
+            record, err = _run_single_backtest(task_args)
+
+            if err:
+                # If backtest fails, return a bad value
+                logger.error(f"Optuna Trial {trial.number} failed with parameters {params}: {err[1]}")
+                return float("-inf") if not ascending else float("inf")
+
+            # Store the metrics on the trial for later retrieval
+            for key, val in record.items():
+                trial.set_user_attr(key, val)
+
+            # Return target metric to optimize
+            return record.get(sort_by, 0.0)
+
+        # Create study
+        direction = "minimize" if ascending else "maximize"
+        if sampler == "tpe":
+            opt_sampler = optuna.samplers.TPESampler()
+        else:
+            opt_sampler = optuna.samplers.RandomSampler()
+
+        study = optuna.create_study(
+            direction=direction,
+            sampler=opt_sampler,
+        )
+
+        study.optimize(objective, n_trials=n_trials)
+
+        # Compile results
+        results = []
+        for trial in study.trials:
+            if trial.state == optuna.trial.TrialState.COMPLETE:
+                res = trial.user_attrs.copy()
+                results.append(res)
+
+        if not results:
+            logger.error("❌ Không chạy thành công bất kỳ thử nghiệm Optuna nào.")
+            return pd.DataFrame()
+
+        results_df = pd.DataFrame(results)
+
+        # Sort results
+        if sort_by in results_df.columns:
+            results_df.sort_values(by=sort_by, ascending=ascending, inplace=True)
+
+        print("\n" + "=" * 60)
+        logger.info("TỐI ƯU HÓA OPTUNA HOÀN TẤT - BẢNG XẾP HẠNG THAM SỐ ĐÃ SẴN SÀNG.")
+        print("=" * 60)
+
+        # Display top 5 parameter sets
+        top_n = min(5, len(results_df))
+        temp_df = results_df.copy()
+
+        # Formatter for pretty printing
+        pct_cols = ["total_return", "cagr", "max_drawdown", "win_rate"]
+        for col in pct_cols:
+            if col in temp_df.columns:
+                temp_df[col] = (temp_df[col] * 100).map("{:.2f}%".format)
+
+        ratio_cols = ["sharpe_ratio", "sortino_ratio", "profit_factor"]
+        for col in ratio_cols:
+            if col in temp_df.columns:
+                temp_df[col] = temp_df[col].map("{:.2f}".format)
+
+        print(temp_df.head(top_n).to_string(index=False))
+        print("=" * 60 + "\n")
+
+        return results_df

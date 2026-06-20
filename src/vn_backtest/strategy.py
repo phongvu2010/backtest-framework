@@ -159,7 +159,24 @@ class Strategy:
         """
         pass
 
-    def buy(self, ticker: str, size: float = None, limit_price: float = None) -> None:
+    @property
+    def orders(self) -> list:
+        """Get the list of pending orders."""
+        return self.engine.pending_orders
+
+    def cancel_order(self, order_id: str) -> bool:
+        """Cancel a pending order by its ID."""
+        return self.engine.cancel_order(order_id)
+
+    def buy(
+        self,
+        ticker: str,
+        size: float = None,
+        limit_price: float = None,
+        stop_price: float = None,
+        expiration_bars: int = None,
+        oco_sibling: Any = None,
+    ) -> Any:
         """
         Place a Buy Order.
 
@@ -170,12 +187,36 @@ class Strategy:
                 - If integer > 1 (e.g., 200): Buys that exact number of shares.
                 - If None: Allocates 100% of available cash.
             limit_price (float, optional): Limit price for the order. If None, it is a Market Order.
+            stop_price (float, optional): Stop price for the order.
+            expiration_bars (int, optional): Expiration of the order in number of bars.
+            oco_sibling (Order, optional): Sibling OCO order.
         """
-        self.engine.place_buy_order(
-            ticker, size, time=self.current_time, limit_price=limit_price
+        oco_sibling_id = oco_sibling.order_id if oco_sibling is not None else None
+        order = self.engine.place_buy_order(
+            ticker,
+            size,
+            time=self.current_time,
+            limit_price=limit_price,
+            stop_price=stop_price,
+            expiration_bars=expiration_bars,
+            oco_sibling_id=oco_sibling_id,
         )
+        if oco_sibling is not None:
+            # Bidirectional linking
+            oco_sibling.oco_sibling_id = order.order_id
+            oco_sibling.order_type = "OCO"
+            order.order_type = "OCO"
+        return order
 
-    def sell(self, ticker: str, size: float = None, limit_price: float = None) -> None:
+    def sell(
+        self,
+        ticker: str,
+        size: float = None,
+        limit_price: float = None,
+        stop_price: float = None,
+        expiration_bars: int = None,
+        oco_sibling: Any = None,
+    ) -> Any:
         """
         Place a Sell Order.
 
@@ -186,12 +227,28 @@ class Strategy:
                 - If integer > 1: Sells that exact number of shares.
                 - If None: Sells the entire position.
             limit_price (float, optional): Limit price for the order. If None, it is a Market Order.
+            stop_price (float, optional): Stop price for the order.
+            expiration_bars (int, optional): Expiration of the order in number of bars.
+            oco_sibling (Order, optional): Sibling OCO order.
         """
-        self.engine.place_sell_order(
-            ticker, size, time=self.current_time, limit_price=limit_price
+        oco_sibling_id = oco_sibling.order_id if oco_sibling is not None else None
+        order = self.engine.place_sell_order(
+            ticker,
+            size,
+            time=self.current_time,
+            limit_price=limit_price,
+            stop_price=stop_price,
+            expiration_bars=expiration_bars,
+            oco_sibling_id=oco_sibling_id,
         )
+        if oco_sibling is not None:
+            # Bidirectional linking
+            oco_sibling.oco_sibling_id = order.order_id
+            oco_sibling.order_type = "OCO"
+            order.order_type = "OCO"
+        return order
 
-    def order_target_percent(self, ticker: str, target_percent: float) -> None:
+    def order_target_percent(self, ticker: str, target_percent: float) -> Any:
         """
         Place a target percent order.
 
@@ -199,7 +256,7 @@ class Strategy:
             ticker (str): The ticker symbol.
             target_percent (float): Target percent of total equity (e.g. 0.2 = 20%, 0.0 = close position).
         """
-        self.engine.place_target_percent_order(
+        return self.engine.place_target_percent_order(
             ticker, target_percent, time=self.current_time
         )
 

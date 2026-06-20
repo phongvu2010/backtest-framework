@@ -9,6 +9,66 @@ from .trading_rules import TradingRulesManager
 logger = logging.getLogger(__name__)
 
 
+class OrderStatus:
+    PENDING = "PENDING"
+    PARTIALLY_FILLED = "PARTIALLY_FILLED"
+    FILLED = "FILLED"
+    CANCELLED = "CANCELLED"
+    EXPIRED = "EXPIRED"
+
+
+class OrderType:
+    MARKET = "MARKET"
+    LIMIT = "LIMIT"
+    STOP = "STOP"
+    OCO = "OCO"
+
+
+class Order:
+    """
+    Represents a trading order in the backtest engine with a tracked lifecycle.
+    """
+    def __init__(
+        self,
+        order_id: str,
+        ticker: str,
+        action: str,  # 'buy' or 'sell'
+        order_type: str,  # 'market', 'limit', 'stop', 'oco'
+        size: float = None,
+        limit_price: float = None,
+        stop_price: float = None,
+        time_placed: pd.Timestamp = None,
+        oco_sibling_id: str = None,
+        expiration_bars: int = None,
+    ):
+        self.order_id = order_id
+        self.ticker = ticker
+        self.action = action.lower()
+        self.order_type = order_type.upper()
+        self.size = size
+        self.limit_price = limit_price
+        self.stop_price = stop_price
+        self.time_placed = time_placed
+        self.oco_sibling_id = oco_sibling_id
+        self.expiration_bars = expiration_bars
+        
+        self.status = OrderStatus.PENDING
+        self.quantity = 0  # To be set when sized
+        self.filled_quantity = 0
+        self.remaining_quantity = 0
+        self.bars_since_placed = 0
+        self.applied_slippage = 0.0
+        self.is_sized = False
+        self.target_percent = None
+
+    def __repr__(self):
+        return (
+            f"Order(id={self.order_id}, ticker={self.ticker}, action={self.action}, "
+            f"type={self.order_type}, status={self.status}, qty={self.quantity}, "
+            f"filled={self.filled_quantity})"
+        )
+
+
 class BacktestEngine:
     """
     Backtesting Engine tailored for the Vietnamese Stock Market.
@@ -138,7 +198,8 @@ class BacktestEngine:
         self.cash_settlement_queue: List[Dict[str, Any]] = []
 
         # Order queues
-        self.pending_orders: List[Dict[str, Any]] = []
+        self.pending_orders: List[Order] = []
+        self.order_counter = 0
 
         # History logs
         self.trades_history: List[Dict[str, Any]] = []
@@ -189,17 +250,36 @@ class BacktestEngine:
         size: Union[float, int, None],
         time: pd.Timestamp,
         limit_price: float = None,
-    ):
+        stop_price: float = None,
+        expiration_bars: int = None,
+        oco_sibling_id: str = None,
+    ) -> Order:
         """Queue a buy order for the next bar."""
-        self.pending_orders.append(
-            {
-                "action": "buy",
-                "ticker": ticker,
-                "size": size,
-                "time_placed": time,
-                "limit_price": limit_price,
-            }
+        self.order_counter += 1
+        order_id = f"order_{self.order_counter}"
+        
+        order_type = OrderType.MARKET
+        if limit_price is not None:
+            order_type = OrderType.LIMIT
+        if stop_price is not None:
+            order_type = OrderType.STOP
+        if oco_sibling_id is not None:
+            order_type = OrderType.OCO
+            
+        order = Order(
+            order_id=order_id,
+            ticker=ticker,
+            action="buy",
+            order_type=order_type,
+            size=size,
+            limit_price=limit_price,
+            stop_price=stop_price,
+            time_placed=time,
+            oco_sibling_id=oco_sibling_id,
+            expiration_bars=expiration_bars,
         )
+        self.pending_orders.append(order)
+        return order
 
     def place_sell_order(
         self,
@@ -207,30 +287,97 @@ class BacktestEngine:
         size: Union[float, int, None],
         time: pd.Timestamp,
         limit_price: float = None,
-    ):
+        stop_price: float = None,
+        expiration_bars: int = None,
+        oco_sibling_id: str = None,
+    ) -> Order:
         """Queue a sell order for the next bar."""
-        self.pending_orders.append(
-            {
-                "action": "sell",
-                "ticker": ticker,
-                "size": size,
-                "time_placed": time,
-                "limit_price": limit_price,
-            }
+        self.order_counter += 1
+        order_id = f"order_{self.order_counter}"
+        
+        order_type = OrderType.MARKET
+        if limit_price is not None:
+            order_type = OrderType.LIMIT
+        if stop_price is not None:
+            order_type = OrderType.STOP
+        if oco_sibling_id is not None:
+            order_type = OrderType.OCO
+            
+        order = Order(
+            order_id=order_id,
+            ticker=ticker,
+            action="sell",
+            order_type=order_type,
+            size=size,
+            limit_price=limit_price,
+            stop_price=stop_price,
+            time_placed=time,
+            oco_sibling_id=oco_sibling_id,
+            expiration_bars=expiration_bars,
         )
+        self.pending_orders.append(order)
+        return order
 
     def place_target_percent_order(
         self, ticker: str, target_percent: float, time: pd.Timestamp
-    ):
+    ) -> Order:
         """Queue a target percent order for the next bar."""
-        self.pending_orders.append(
-            {
-                "action": "target_percent",
-                "ticker": ticker,
-                "target_percent": target_percent,
-                "time_placed": time,
-            }
+        self.order_counter += 1
+        order_id = f"order_{self.order_counter}"
+        
+        order = Order(
+            order_id=order_id,
+            ticker=ticker,
+            action="target_percent",
+            order_type=OrderType.MARKET,
+            time_placed=time,
         )
+        order.target_percent = target_percent
+        self.pending_orders.append(order)
+        return order
+
+    def cancel_order(self, order_id: str) -> bool:
+        """Cancel a pending order by its ID. Cascades to OCO siblings."""
+        found = False
+        target_order = None
+        for order in self.pending_orders:
+            if order.order_id == order_id:
+                target_order = order
+                found = True
+                break
+        
+        if not found and hasattr(self, "_current_executing_orders") and self._current_executing_orders:
+            for order in self._current_executing_orders:
+                if order.order_id == order_id:
+                    target_order = order
+                    found = True
+                    break
+        
+        if found and target_order is not None:
+            if target_order.status in [OrderStatus.FILLED, OrderStatus.CANCELLED, OrderStatus.EXPIRED]:
+                return False
+            
+            target_order.status = OrderStatus.CANCELLED
+            if target_order in self.pending_orders:
+                self.pending_orders.remove(target_order)
+            
+            self.order_logs.append(
+                {
+                    "Date": self.dates[self.current_idx] if hasattr(self, "current_idx") else None,
+                    "Ticker": target_order.ticker,
+                    "Action": "ORDER_CANCELLED",
+                    "Reason": "Cancelled by strategy or user",
+                    "Price": 0.0,
+                    "Quantity": target_order.quantity,
+                }
+            )
+            
+            # Cascade cancel OCO sibling if exists
+            if target_order.oco_sibling_id:
+                self.cancel_order(target_order.oco_sibling_id)
+                
+            return True
+        return False
 
     def _get_execution_price(self, row: pd.Series) -> float:
         """Calculate base execution price according to the execution model."""
@@ -1198,19 +1345,44 @@ class BacktestEngine:
 
         # Sort evaluated orders: SELL first, BUY second to free up cash first
         sorted_orders = sorted(
-            orders_to_process, key=lambda x: 0 if x["action"] == "sell" else 1
+            orders_to_process, key=lambda x: 0 if x.action == "sell" else 1
         )
+        self._current_executing_orders = sorted_orders
 
         for order in sorted_orders:
             # Skip executing orders placed on the current bar (they will execute on the next bar)
-            if order.get("time_placed") == current_time:
+            if order.time_placed == current_time:
                 self.pending_orders.append(order)
                 continue
 
-            ticker = order["ticker"]
-            action = order["action"]
-            qty = order["quantity"]
-            time_placed = order["time_placed"]
+            # Skip if cancelled, filled or expired
+            if order.status in [OrderStatus.CANCELLED, OrderStatus.FILLED, OrderStatus.EXPIRED]:
+                continue
+
+            # Increment bars since placed
+            order.bars_since_placed += 1
+
+            # Check expiration
+            if order.expiration_bars is not None and order.bars_since_placed > order.expiration_bars:
+                order.status = OrderStatus.EXPIRED
+                self.order_logs.append(
+                    {
+                        "Date": current_time,
+                        "Ticker": order.ticker,
+                        "Action": "ORDER_EXPIRED",
+                        "Reason": f"Order expired after {order.expiration_bars} bars",
+                        "Price": 0.0,
+                        "Quantity": order.quantity,
+                    }
+                )
+                if order.oco_sibling_id:
+                    self.cancel_order(order.oco_sibling_id)
+                continue
+
+            ticker = order.ticker
+            action = order.action
+            qty = order.remaining_quantity
+            time_placed = order.time_placed
 
             # Check if ticker traded on current_time
             ticker_df = self.data[ticker]
@@ -1263,9 +1435,39 @@ class BacktestEngine:
                 1 if self._is_odd_lot_allowed(ticker, current_time) else lot_size
             )
 
+            # Check Stop Order condition
+            if order.stop_price is not None:
+                stop_triggered = False
+                if action == "buy":
+                    if row["High"] >= order.stop_price:
+                        stop_triggered = True
+                        base_price = max(row["Open"], order.stop_price)
+                elif action == "sell":
+                    if row["Low"] <= order.stop_price:
+                        stop_triggered = True
+                        base_price = min(row["Open"], order.stop_price)
+
+                if not stop_triggered:
+                    self.pending_orders.append(order)
+                    continue
+                
+                # If stop triggered and limit_price is present, check limit condition
+                if order.limit_price is not None:
+                    if action == "buy":
+                        if row["Low"] <= order.limit_price:
+                            base_price = min(base_price, order.limit_price)
+                        else:
+                            self.pending_orders.append(order)
+                            continue
+                    elif action == "sell":
+                        if row["High"] >= order.limit_price:
+                            base_price = max(base_price, order.limit_price)
+                        else:
+                            self.pending_orders.append(order)
+                            continue
             # Execution Price (handling Limit Orders)
-            limit_price = order.get("limit_price", None)
-            if limit_price is not None:
+            elif order.limit_price is not None:
+                limit_price = order.limit_price
                 if action == "buy":
                     if row["Low"] <= limit_price:
                         base_price = min(row["Open"], limit_price)
@@ -1300,6 +1502,9 @@ class BacktestEngine:
                         "Quantity": 0,
                     }
                 )
+                order.status = OrderStatus.CANCELLED
+                if order.oco_sibling_id:
+                    self.cancel_order(order.oco_sibling_id)
                 continue
 
             if action == "sell" and is_floor and self.restrict_floor_sell:
@@ -1313,10 +1518,14 @@ class BacktestEngine:
                         "Quantity": 0,
                     }
                 )
+                order.status = OrderStatus.CANCELLED
+                if order.oco_sibling_id:
+                    self.cancel_order(order.oco_sibling_id)
                 continue
 
-            # Apply Slippage (only for market orders)
+            # Apply Slippage (only for market/stop orders)
             exec_price = base_price
+            limit_price = order.limit_price
             if limit_price is None:
                 # Calculate percentage slippage
                 pct_slippage = self.slippage
@@ -1336,7 +1545,7 @@ class BacktestEngine:
                 else:
                     exec_price = exec_price * (1.0 - pct_slippage)
 
-                order["applied_slippage"] = pct_slippage
+                order.applied_slippage = pct_slippage
 
                 # Add absolute minimum slippage (half tick size for spread)
                 tick_size = self._get_tick_size(base_price, exch, current_time)
@@ -1379,8 +1588,6 @@ class BacktestEngine:
                     if qty > max_qty:
                         qty = max_qty
 
-                deferred_qty = original_qty - qty
-
                 if qty <= 0:
                     # Defer the whole buy order to the next day
                     self.pending_orders.append(order)
@@ -1395,27 +1602,6 @@ class BacktestEngine:
                         }
                     )
                     continue
-
-                if deferred_qty > 0:
-                    self.pending_orders.append(
-                        {
-                            "action": "buy",
-                            "ticker": ticker,
-                            "quantity": deferred_qty,
-                            "time_placed": time_placed,
-                            "limit_price": order.get("limit_price", None),
-                        }
-                    )
-                    self.order_logs.append(
-                        {
-                            "Date": current_time,
-                            "Ticker": ticker,
-                            "Action": "BUY_PARTIALLY_DEFERRED",
-                            "Reason": f"Bought {qty} shares, deferred {deferred_qty} due to volume limits",
-                            "Price": exec_price,
-                            "Quantity": deferred_qty,
-                        }
-                    )
 
                 # Calculate Net Equity and max spend for margin trading
                 current_positions_value = sum(
@@ -1510,6 +1696,7 @@ class BacktestEngine:
                     qty = best_qty
 
                     if qty <= 0:
+                        order.status = OrderStatus.CANCELLED
                         self.order_logs.append(
                             {
                                 "Date": current_time,
@@ -1520,6 +1707,8 @@ class BacktestEngine:
                                 "Quantity": 0,
                             }
                         )
+                        if order.oco_sibling_id:
+                            self.cancel_order(order.oco_sibling_id)
                         continue
 
                     trade_value = qty * exec_price
@@ -1592,21 +1781,50 @@ class BacktestEngine:
                     "TimePlaced": time_placed,
                 }
                 self.trades_history.append(trade_record)
-                self.order_logs.append(
-                    {
-                        "Date": current_time,
-                        "Ticker": ticker,
-                        "Action": "BUY_FILLED",
-                        "Reason": "Success"
-                        + (
-                            f" (Ứng trước, phí: {advance_fee:,.0f}đ)"
-                            if advance_fee > 0
-                            else ""
-                        ),
-                        "Price": exec_price,
-                        "Quantity": qty,
-                    }
-                )
+                
+                # Update Order status
+                order.filled_quantity += qty
+                deferred_qty = original_qty - qty
+                order.remaining_quantity = deferred_qty
+
+                if deferred_qty > 0:
+                    order.status = OrderStatus.PARTIALLY_FILLED
+                    self.pending_orders.append(order)
+                    self.order_logs.append(
+                        {
+                            "Date": current_time,
+                            "Ticker": ticker,
+                            "Action": "BUY_PARTIALLY_FILLED",
+                            "Reason": f"Bought {qty} shares, deferred {deferred_qty} due to volume limits/cash"
+                            + (
+                                f" (Ứng trước, phí: {advance_fee:,.0f}đ)"
+                                if advance_fee > 0
+                                else ""
+                            ),
+                            "Price": exec_price,
+                            "Quantity": qty,
+                        }
+                    )
+                else:
+                    order.status = OrderStatus.FILLED
+                    self.order_logs.append(
+                        {
+                            "Date": current_time,
+                            "Ticker": ticker,
+                            "Action": "BUY_FILLED",
+                            "Reason": "Success"
+                            + (
+                                f" (Ứng trước, phí: {advance_fee:,.0f}đ)"
+                                if advance_fee > 0
+                                else ""
+                            ),
+                            "Price": exec_price,
+                            "Quantity": qty,
+                        }
+                    )
+
+                if order.oco_sibling_id:
+                    self.cancel_order(order.oco_sibling_id)
 
                 # Update tracking of entry prices
                 old_qty = self.positions.get(ticker, 0) - qty
@@ -1667,6 +1885,7 @@ class BacktestEngine:
                         deferred_qty = original_qty - qty
 
                 if qty <= 0:
+                    order.status = OrderStatus.CANCELLED
                     self.order_logs.append(
                         {
                             "Date": current_time,
@@ -1677,29 +1896,9 @@ class BacktestEngine:
                             "Quantity": 0,
                         }
                     )
+                    if order.oco_sibling_id:
+                        self.cancel_order(order.oco_sibling_id)
                     continue
-
-                # If there is a remaining deferred portion, queue it back for the next bar
-                if deferred_qty > 0:
-                    self.pending_orders.append(
-                        {
-                            "action": "sell",
-                            "ticker": ticker,
-                            "quantity": deferred_qty,
-                            "time_placed": time_placed,
-                            "limit_price": order.get("limit_price", None),
-                        }
-                    )
-                    self.order_logs.append(
-                        {
-                            "Date": current_time,
-                            "Ticker": ticker,
-                            "Action": "SELL_PARTIALLY_DEFERRED",
-                            "Reason": f"Sold {qty} shares, deferred {deferred_qty} due to settlement lock",
-                            "Price": exec_price,
-                            "Quantity": deferred_qty,
-                        }
-                    )
 
                 # Execute Sell Trade
                 trade_value = qty * exec_price
@@ -1740,6 +1939,7 @@ class BacktestEngine:
                         del self.position_highest_price[ticker]
                     if ticker in self.dividend_shares:
                         del self.dividend_shares[ticker]
+
                 if ticker in self.sellable_shares and self.sellable_shares[ticker] == 0:
                     del self.sellable_shares[ticker]
 
@@ -1756,17 +1956,42 @@ class BacktestEngine:
                     "TimePlaced": time_placed,
                 }
                 self.trades_history.append(trade_record)
-                self.order_logs.append(
-                    {
-                        "Date": current_time,
-                        "Ticker": ticker,
-                        "Action": "SELL_FILLED",
-                        "Reason": "Success",
-                        "Price": exec_price,
-                        "Quantity": qty,
-                    }
-                )
+                
+                # Update Order status
+                order.filled_quantity += qty
+                order.remaining_quantity = deferred_qty
 
+                if deferred_qty > 0:
+                    order.status = OrderStatus.PARTIALLY_FILLED
+                    self.pending_orders.append(order)
+                    self.order_logs.append(
+                        {
+                            "Date": current_time,
+                            "Ticker": ticker,
+                            "Action": "SELL_PARTIALLY_FILLED",
+                            "Reason": f"Sold {qty} shares, deferred {deferred_qty} due to settlement lock/volume limits",
+                            "Price": exec_price,
+                            "Quantity": qty,
+                        }
+                    )
+                else:
+                    order.status = OrderStatus.FILLED
+                    self.order_logs.append(
+                        {
+                            "Date": current_time,
+                            "Ticker": ticker,
+                            "Action": "SELL_FILLED",
+                            "Reason": "Success",
+                            "Price": exec_price,
+                            "Quantity": qty,
+                        }
+                    )
+
+                if order.oco_sibling_id:
+                    self.cancel_order(order.oco_sibling_id)
+
+        if hasattr(self, "_current_executing_orders"):
+            del self._current_executing_orders
     def _reindex_and_fill_data(self):
         """Reindex each ticker's DataFrame to the unified timeline and fill missing values."""
         self.last_active_dates = {}
@@ -1818,20 +2043,18 @@ class BacktestEngine:
         """
         sized_orders = []
         for order in self.pending_orders:
-            action = order["action"]
-            ticker = order["ticker"]
+            action = order.action
+            ticker = order.ticker
 
             # Check if this order has already been sized (e.g. deferred from a previous day due to settlement lock)
-            if (
-                "quantity" in order
-                and "size" not in order
-                and "target_percent" not in order
-            ):
+            if order.is_sized:
                 # Keep it as is but cap the sell quantity if our total position has changed
                 if action == "sell":
                     total_pos = self.positions.get(ticker, 0)
-                    order["quantity"] = min(order["quantity"], total_pos)
-                    if order["quantity"] <= 0:
+                    order.quantity = min(order.quantity, total_pos)
+                    order.remaining_quantity = min(order.remaining_quantity, total_pos)
+                    if order.quantity <= 0:
+                        order.status = OrderStatus.CANCELLED
                         continue
                 sized_orders.append(order)
                 continue
@@ -1846,6 +2069,7 @@ class BacktestEngine:
 
             if close_price is None or pd.isna(close_price) or close_price <= 0:
                 # Cannot size order without price, reject it
+                order.status = OrderStatus.CANCELLED
                 self.order_logs.append(
                     {
                         "Date": current_time,
@@ -1865,19 +2089,19 @@ class BacktestEngine:
 
             # Calculate total portfolio equity for target percent or margin calculations
             positions_value = 0.0
-            for t, qty in self.positions.items():
+            for t, pos_qty in self.positions.items():
                 t_df = self.data[t]
                 if current_time in t_df.index:
                     c_price = t_df.loc[current_time, "Close"]
                 else:
                     c_val = self._prev_close_cache[t].get(current_time, 0.0) or 0.0
                     c_price = 0.0 if pd.isna(c_val) else float(c_val)
-                positions_value += qty * c_price
+                positions_value += pos_qty * c_price
             equity = self.cash + positions_value
 
             qty = 0
             if action == "target_percent":
-                target_percent = order["target_percent"]
+                target_percent = order.target_percent
                 current_qty = self.positions.get(ticker, 0)
 
                 if target_percent == 0.0:
@@ -1920,7 +2144,7 @@ class BacktestEngine:
                         continue  # No change needed
             else:
                 # Standard buy or sell
-                size = order.get("size")
+                size = order.size
                 if action == "buy":
                     if size is None:
                         # Use all available cash (or max spend if margin)
@@ -1961,7 +2185,6 @@ class BacktestEngine:
 
                 elif action == "sell":
                     # Size against total positions instead of sellable_shares to prevent T+2 locked orders from being discarded.
-                    # The settlement check and deferral will be handled correctly during execution next day in _execute_orders.
                     total_pos = self.positions.get(ticker, 0)
                     if size is None:
                         qty = total_pos
@@ -1986,15 +2209,13 @@ class BacktestEngine:
                         continue
 
             if qty > 0:
-                sized_orders.append(
-                    {
-                        "action": action,
-                        "ticker": ticker,
-                        "quantity": qty,
-                        "time_placed": order["time_placed"],
-                        "limit_price": order.get("limit_price", None),
-                    }
-                )
+                order.action = action
+                order.quantity = qty
+                order.remaining_quantity = qty
+                order.is_sized = True
+                sized_orders.append(order)
+            else:
+                order.status = OrderStatus.CANCELLED
         self.pending_orders = sized_orders
 
     def _check_risk_management(
