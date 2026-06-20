@@ -31,3 +31,9 @@ dependencies = [
 [project.urls]
 "Homepage" = "https://github.com/phongvu2010/vn-backtest"
 "Bug Tracker" = "https://github.com/phongvu2010/vn-backtest/issues"
+
+[project.optional-dependencies]
+optimize = ["optuna"]
+
+[tool.setuptools.package-data]
+"vn_backtest" = ["templates/*.html", "templates/*.css"]

@@ -1,5 +1,4 @@
 *.py[cod]
-*.html
 *.png
 _version.py
 
@@ -14,6 +13,7 @@ htmlcov/*
 
 doc/build/*
 build/*
+reports/*
 
 .idea/*
 .vscode/
