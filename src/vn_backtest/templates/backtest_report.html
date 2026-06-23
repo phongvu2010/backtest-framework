@@ -149,6 +149,24 @@
                 </div>
                 <div class="metric-subtext">Vượt trội so với thị trường: {{ (metrics.outperformance * 100) | round(2) }}%</div>
             </div>
+
+            <!-- Calmar & Recovery Factor -->
+            <div class="card">
+                <div class="metric-label">Hệ Số Calmar / Recovery Factor</div>
+                <div class="metric-value">
+                    {{ metrics.calmar_ratio | round(2) if metrics.calmar_ratio is not none else 'N/A' }} / {{ metrics.recovery_factor | round(2) if metrics.recovery_factor is not none else 'N/A' }}
+                </div>
+                <div class="metric-subtext">LN ròng so với mức sụt giảm tài sản lớn nhất</div>
+            </div>
+
+            <!-- Expectancy & Information Ratio -->
+            <div class="card">
+                <div class="metric-label">Kỳ vọng giao dịch / Info Ratio</div>
+                <div class="metric-value">
+                    {% if metrics.expectancy >= 0 %}+{% endif %}{{ (metrics.expectancy * 100) | round(2) }}% / {{ metrics.information_ratio | round(2) if metrics.information_ratio is not none else 'N/A' }}
+                </div>
+                <div class="metric-subtext">Kỳ vọng mỗi lệnh / Sharpe Ratio chủ động</div>
+            </div>
         </div>
 
         <!-- CHARTS SECTION -->

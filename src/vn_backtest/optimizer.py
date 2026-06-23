@@ -29,6 +29,8 @@ def _run_single_backtest(task_args):
     try:
         # Merge custom engine kwargs with the current strategy parameters
         kwargs = engine_kwargs.copy()
+        if "check_lookahead" not in kwargs:
+            kwargs["check_lookahead"] = False
 
         # Merge global strategy parameters (e.g. SL/TS from CLI) with grid parameters
         combined_strategy_params = params.copy()
@@ -60,20 +62,46 @@ def _run_single_backtest(task_args):
             include_auto_close=True,
         )
 
+        is_bankrupt = backtest_res.get("is_bankrupt", False)
+
         # Combine parameters and performance metrics
         record = params.copy()
-        record.update(
-            {
-                "total_return": metrics.get("total_return", 0.0),
-                "cagr": metrics.get("cagr", 0.0),
-                "sharpe_ratio": metrics.get("sharpe_ratio", 0.0),
-                "sortino_ratio": metrics.get("sortino_ratio", 0.0),
-                "max_drawdown": metrics.get("max_drawdown", 0.0),
-                "win_rate": metrics.get("win_rate", 0.0),
-                "profit_factor": metrics.get("profit_factor", 0.0),
-                "total_trades": metrics.get("total_trades", 0),
-            }
-        )
+        if is_bankrupt:
+            record.update(
+                {
+                    "total_return": -1.0,
+                    "cagr": -1.0,
+                    "sharpe_ratio": -99.0,
+                    "sortino_ratio": -99.0,
+                    "calmar_ratio": -99.0,
+                    "recovery_factor": -99.0,
+                    "information_ratio": -99.0,
+                    "expectancy": -99.0,
+                    "max_drawdown": -1.0,
+                    "win_rate": 0.0,
+                    "profit_factor": 0.0,
+                    "total_trades": metrics.get("total_trades", 0),
+                    "is_bankrupt": True,
+                }
+            )
+        else:
+            record.update(
+                {
+                    "total_return": metrics.get("total_return", 0.0),
+                    "cagr": metrics.get("cagr", 0.0),
+                    "sharpe_ratio": metrics.get("sharpe_ratio", 0.0),
+                    "sortino_ratio": metrics.get("sortino_ratio", 0.0),
+                    "calmar_ratio": metrics.get("calmar_ratio"),
+                    "recovery_factor": metrics.get("recovery_factor"),
+                    "information_ratio": metrics.get("information_ratio"),
+                    "expectancy": metrics.get("expectancy", 0.0),
+                    "max_drawdown": metrics.get("max_drawdown", 0.0),
+                    "win_rate": metrics.get("win_rate", 0.0),
+                    "profit_factor": metrics.get("profit_factor", 0.0),
+                    "total_trades": metrics.get("total_trades", 0),
+                    "is_bankrupt": False,
+                }
+            )
         return record, None
     except Exception as e:
         err_msg = f"{e}\n{traceback.format_exc()}"
@@ -90,23 +118,25 @@ class ParameterOptimizer:
         self,
         data: Any,
         strategy_class: Type[Strategy],
-        param_grid: Dict[str, List[Any]],
+        param_grid: Dict[str, List[Any]] = None,
         initial_cash: float = 100_000_000.0,
         exchange: Any = "hose",
         benchmark_data: pd.DataFrame = None,
         risk_free_rate: float = 0.04,
         engine_kwargs: Dict[str, Any] = None,
         n_jobs: int = -1,
+        param_space: Dict[str, Any] = None,
     ):
         self.data = data
         self.strategy_class = strategy_class
-        self.param_grid = param_grid
+        self.param_grid = param_grid or {}
         self.initial_cash = initial_cash
         self.exchange = exchange
         self.benchmark_data = benchmark_data
         self.risk_free_rate = risk_free_rate
         self.engine_kwargs = engine_kwargs or {}
         self.n_jobs = n_jobs
+        self.param_space = param_space
 
     def run_optimization(
         self, sort_by: str = "sharpe_ratio", ascending: bool = False
@@ -241,6 +271,7 @@ class ParameterOptimizer:
         sort_by: str = "sharpe_ratio",
         ascending: bool = False,
         sampler: str = "tpe",
+        param_space: Dict[str, Any] = None,
     ) -> pd.DataFrame:
         """
         Run parameter optimization using Optuna's Bayesian optimization.
@@ -250,6 +281,13 @@ class ParameterOptimizer:
             sort_by (str): Metric to maximize/minimize.
             ascending (bool): If True, minimize. If False, maximize.
             sampler (str): Sampler type ('tpe' or 'random').
+            param_space (Dict[str, Any], optional): Dictionary defining the search space.
+                Example:
+                    param_space = {
+                        "sma_fast": ("int", 5, 20),
+                        "stop_loss": ("float", 0.01, 0.1),
+                        "order_type": ("categorical", ["ATO", "ATC", "LIMIT"])
+                    }
 
         Returns:
             pd.DataFrame: Optimization results with parameters and metrics.
@@ -271,12 +309,36 @@ class ParameterOptimizer:
         # Optuna logging level
         optuna.logging.set_verbosity(optuna.logging.WARNING)
 
+        # Resolve param space (use instance param_space or param_grid if none provided)
+        resolved_space = param_space or self.param_space
+        if resolved_space is None:
+            resolved_space = {k: ("categorical", v) for k, v in self.param_grid.items()}
+
         # Objective function
         def objective(trial):
             # Suggest parameters
             params = {}
-            for param_name, values in self.param_grid.items():
-                params[param_name] = trial.suggest_categorical(param_name, values)
+            for param_name, config in resolved_space.items():
+                if isinstance(config, (list, tuple)) and len(config) > 0:
+                    opt_type = config[0]
+                    if opt_type == "int" and len(config) >= 3:
+                        low, high = config[1], config[2]
+                        step = config[3] if len(config) > 3 else 1
+                        params[param_name] = trial.suggest_int(param_name, low, high, step=step)
+                    elif opt_type == "float" and len(config) >= 3:
+                        low, high = config[1], config[2]
+                        step = config[3] if len(config) > 3 else None
+                        log = config[4] if len(config) > 4 else False
+                        params[param_name] = trial.suggest_float(param_name, low, high, step=step, log=log)
+                    elif opt_type == "categorical" and len(config) >= 2:
+                        choices = config[1]
+                        params[param_name] = trial.suggest_categorical(param_name, choices)
+                    else:
+                        # Fallback for config being a raw list of choices
+                        params[param_name] = trial.suggest_categorical(param_name, config)
+                else:
+                    # Fallback to categorical choice
+                    params[param_name] = trial.suggest_categorical(param_name, [config] if not isinstance(config, list) else config)
 
             # Run backtest
             task_args = (
@@ -302,6 +364,10 @@ class ParameterOptimizer:
             # Store the metrics on the trial for later retrieval
             for key, val in record.items():
                 trial.set_user_attr(key, val)
+
+            if record.get("is_bankrupt", False):
+                # Penalize bankruptcy by returning worst possible value
+                return float("-inf") if not ascending else float("inf")
 
             # Return target metric to optimize
             return record.get(sort_by, 0.0)

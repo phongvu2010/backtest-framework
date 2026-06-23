@@ -5,71 +5,11 @@ from typing import Type, Union, List, Dict, Any
 from collections import deque
 from .strategy import Strategy
 from .trading_rules import TradingRulesManager
+from .margin import MarginManager
+from .corporate_actions import CorporateActionProcessor
+from .orders import Order, OrderStatus, OrderType
 
 logger = logging.getLogger(__name__)
-
-
-class OrderStatus:
-    PENDING = "PENDING"
-    PARTIALLY_FILLED = "PARTIALLY_FILLED"
-    FILLED = "FILLED"
-    CANCELLED = "CANCELLED"
-    EXPIRED = "EXPIRED"
-
-
-class OrderType:
-    MARKET = "MARKET"
-    LIMIT = "LIMIT"
-    STOP = "STOP"
-    OCO = "OCO"
-    ATO = "ATO"
-    ATC = "ATC"
-
-
-class Order:
-    """
-    Represents a trading order in the backtest engine with a tracked lifecycle.
-    """
-
-    def __init__(
-        self,
-        order_id: str,
-        ticker: str,
-        action: str,  # 'buy' or 'sell'
-        order_type: str,  # 'market', 'limit', 'stop', 'oco'
-        size: float = None,
-        limit_price: float = None,
-        stop_price: float = None,
-        time_placed: pd.Timestamp = None,
-        oco_sibling_id: str = None,
-        expiration_bars: int = None,
-    ):
-        self.order_id = order_id
-        self.ticker = ticker
-        self.action = action.lower()
-        self.order_type = order_type.upper()
-        self.size = size
-        self.limit_price = limit_price
-        self.stop_price = stop_price
-        self.time_placed = time_placed
-        self.oco_sibling_id = oco_sibling_id
-        self.expiration_bars = expiration_bars
-
-        self.status = OrderStatus.PENDING
-        self.quantity = 0  # To be set when sized
-        self.filled_quantity = 0
-        self.remaining_quantity = 0
-        self.bars_since_placed = 0
-        self.applied_slippage = 0.0
-        self.is_sized = False
-        self.target_percent = None
-
-    def __repr__(self):
-        return (
-            f"Order(id={self.order_id}, ticker={self.ticker}, action={self.action}, "
-            f"type={self.order_type}, status={self.status}, qty={self.quantity}, "
-            f"filled={self.filled_quantity})"
-        )
 
 
 class BacktestEngine:
@@ -100,7 +40,11 @@ class BacktestEngine:
         auto_close_at_end: bool = True,  # Sell all positions at final bar
         allow_odd_lot: bool = False,  # Allow odd lot trading (1-99 shares)
         max_volume_ratio: float = None,  # Max trade size as a fraction of daily volume
-        adjust_corporate_actions: bool = False,  # Set True to simulate corporate actions (splits/dividends)
+        volume_limit_ratio: float = 0.10,  # Default market participation limit (10% of daily volume)
+        limit_order_fill_policy: str = "conservative",  # Limit order fill policy: 'standard' or 'conservative'
+        limit_fill_fraction: float = 0.20,  # Fraction to fill when limit price touches Low/High (20%)
+        min_daily_volume: int = 10000,  # Minimum daily volume required for trading (10k shares)
+        adjust_corporate_actions: bool = True,  # Set True to simulate corporate actions (splits/dividends)
         force_adjusted: bool = None,  # Force adjusted status (True: already adjusted, False: raw)
         margin_ratio: float = 1.0,  # 1.0 = no margin, 0.5 = 50% margin (2x leverage)
         margin_interest_rate: float = 0.13,  # 13% p.a. Margin Loan interest
@@ -112,6 +56,7 @@ class BacktestEngine:
         dividend_tax_rate: float = 0.05,  # 5% dividend tax rate in VN
         price_scale: float = 1.0,
         listing_dates: Dict[str, Union[str, pd.Timestamp]] = None,
+        check_lookahead: bool = True,  # Option to bypass look-ahead bias checks
     ):
         # Handle multi-ticker data dict
         if isinstance(data, pd.DataFrame):
@@ -130,7 +75,38 @@ class BacktestEngine:
         else:
             raise ValueError("Data must be a pandas DataFrame or a dict of DataFrames")
 
-        self.corporate_actions = corporate_actions or {}
+        # [TIMEZONE ALIGNMENT] Ensure all data indices are timezone-naive
+        for ticker_k, df_val in list(self.data.items()):
+            if hasattr(df_val.index, "tz") and df_val.index.tz is not None:
+                df_val.index = df_val.index.tz_localize(None)
+                self.data[ticker_k] = df_val
+
+        # [TIMEZONE ALIGNMENT] Ensure corporate actions are timezone-naive
+        self.corporate_actions = {}
+        if corporate_actions:
+            for ticker_k, df_val in corporate_actions.items():
+                df_copy = df_val.copy()
+                if hasattr(df_copy.index, "tz") and df_copy.index.tz is not None:
+                    df_copy.index = df_copy.index.tz_localize(None)
+                for col in df_copy.columns:
+                    if pd.api.types.is_datetime64_any_dtype(df_copy[col]):
+                        if df_copy[col].dt.tz is not None:
+                            df_copy[col] = df_copy[col].dt.tz_localize(None)
+                self.corporate_actions[ticker_k] = df_copy
+
+        # Pre-group corporate actions by exright_date for O(1) daily lookups
+        self.corporate_actions_by_date = {}
+        for ticker, df in self.corporate_actions.items():
+            if df.empty or "exright_date" not in df.columns:
+                continue
+            for _, row in df.iterrows():
+                dt = row["exright_date"]
+                if pd.notna(dt):
+                    norm_dt = pd.to_datetime(dt).normalize()
+                    if norm_dt not in self.corporate_actions_by_date:
+                        self.corporate_actions_by_date[norm_dt] = []
+                    self.corporate_actions_by_date[norm_dt].append((ticker, row))
+
         self.strategy_class = strategy_class
         self.initial_cash = initial_cash
         self.buy_fee = buy_fee
@@ -148,6 +124,10 @@ class BacktestEngine:
         self.auto_close_at_end = auto_close_at_end
         self.allow_odd_lot = allow_odd_lot
         self.max_volume_ratio = max_volume_ratio
+        self.volume_limit_ratio = volume_limit_ratio
+        self.limit_order_fill_policy = limit_order_fill_policy.lower()
+        self.limit_fill_fraction = limit_fill_fraction
+        self.min_daily_volume = min_daily_volume
         self.adjust_corporate_actions = adjust_corporate_actions
         self.force_adjusted = force_adjusted
         self.margin_ratio = margin_ratio
@@ -158,6 +138,7 @@ class BacktestEngine:
         self.dividend_tax_rate = dividend_tax_rate
         self.price_scale = price_scale
         self.dividend_shares = {}
+        self.check_lookahead = check_lookahead
 
         # Risk management tracking
         self.position_entry_price = {}
@@ -176,15 +157,13 @@ class BacktestEngine:
         else:
             self.exchanges = {ticker: "hose" for ticker in self.data}
 
-        # Align all dates to create unified timeline
+        # Align all dates to create unified timeline (already normalized to tz-naive)
         all_dates = set()
         for df in self.data.values():
             all_dates.update(df.index)
         self.dates = sorted(list(all_dates))
 
         # Fetch corporate actions for all tickers if enabled
-        self.corporate_actions = corporate_actions or {}
-
         # Track pending cash dividends: list of dicts {'amount': float, 'payout_date': datetime, 'ticker': str}
         self.pending_dividends: List[Dict[str, Any]] = []
 
@@ -210,6 +189,11 @@ class BacktestEngine:
         self.trades_history: List[Dict[str, Any]] = []
         self.order_logs: List[Dict[str, Any]] = []
         self.portfolio_history: List[Dict[str, Any]] = []
+        self.is_bankrupt = False
+
+        # Initialize managers
+        self.margin_manager = MarginManager(self)
+        self.corporate_processor = CorporateActionProcessor(self)
 
         # Detect if data is already adjusted
         self.dividends_already_factored = False
@@ -217,27 +201,28 @@ class BacktestEngine:
             if self.force_adjusted is not None:
                 self.dividends_already_factored = self.force_adjusted
             else:
-                self.dividends_already_factored = self._detect_if_adjusted()
+                self.dividends_already_factored = self.corporate_processor.detect_if_adjusted()
 
             if self.dividends_already_factored:
-                print("==============================================================")
                 logger.warning(
+                    "==============================================================\n"
                     "CẢNH BÁO: Phát hiện dữ liệu giá đầu vào đã được ĐIỀU CHỈNH (Adjusted). "
-                    "Tự động vô hiệu hóa việc cộng dồn cổ tức/chia tách để tránh lỗi Double-Adjustment."
+                    "Tự động vô hiệu hóa việc cộng dồn cổ tức/chia tách để tránh lỗi Double-Adjustment.\n"
+                    "=============================================================="
                 )
-                print("==============================================================")
 
         # Calculate adjusted price columns
-        self._calculate_adjusted_prices()
+        self.corporate_processor.calculate_adjusted_prices()
 
-        # Identify first listing dates before reindexing
+        # Identify first listing dates before reindexing (and normalize timezone)
         self.raw_listing_dates = {}
         input_listing_dates = listing_dates or {}
         for ticker in self.data:
             if ticker in input_listing_dates:
-                self.raw_listing_dates[ticker] = pd.to_datetime(
-                    input_listing_dates[ticker]
-                )
+                dt_val = pd.to_datetime(input_listing_dates[ticker])
+                if dt_val.tz is not None:
+                    dt_val = dt_val.tz_localize(None)
+                self.raw_listing_dates[ticker] = dt_val
 
         # Initialize TradingRulesManager
         self.rules = TradingRulesManager(
@@ -287,6 +272,7 @@ class BacktestEngine:
         expiration_bars: int = None,
         oco_sibling_id: str = None,
         order_type: str = None,
+        note: str = None,  # Custom transaction notes or tracking info
     ) -> Order:
         """Queue a buy order for the next bar."""
         self.order_counter += 1
@@ -314,6 +300,7 @@ class BacktestEngine:
             time_placed=time,
             oco_sibling_id=oco_sibling_id,
             expiration_bars=expiration_bars,
+            note=note,
         )
         self.pending_orders.append(order)
         return order
@@ -328,6 +315,7 @@ class BacktestEngine:
         expiration_bars: int = None,
         oco_sibling_id: str = None,
         order_type: str = None,
+        note: str = None,  # Custom transaction notes or tracking info
     ) -> Order:
         """Queue a sell order for the next bar."""
         self.order_counter += 1
@@ -355,6 +343,7 @@ class BacktestEngine:
             time_placed=time,
             oco_sibling_id=oco_sibling_id,
             expiration_bars=expiration_bars,
+            note=note,
         )
         self.pending_orders.append(order)
         return order
@@ -432,25 +421,33 @@ class BacktestEngine:
             return True
         return False
 
-    def _get_execution_price(self, row: pd.Series) -> float:
-        """Calculate base execution price according to the execution model."""
+    def _get_execution_price(self, ticker: str, idx: int) -> float:
+        """Calculate base execution price according to the execution model using cached arrays."""
         exec_mode = self.execution_at.lower()
+        arrays = self._price_arrays[ticker]
+        open_p = float(arrays["Open"][idx])
+        close_p = float(arrays["Close"][idx])
+        high_p = float(arrays["High"][idx])
+        low_p = float(arrays["Low"][idx])
+
         if exec_mode == "open":
-            return float(row["Open"])
+            return open_p
         elif exec_mode == "close":
-            return float(row["Close"])
+            return close_p
         elif exec_mode in ["average", "vwap"]:
-            if "Average" in row and pd.notna(row["Average"]) and row["Average"] > 0:
-                return float(row["Average"])
+            if "Average" in arrays:
+                avg_val = arrays["Average"][idx]
+                if pd.notna(avg_val) and avg_val > 0:
+                    return float(avg_val)
             # fallback to OHLC average
-            return float((row["Open"] + row["High"] + row["Low"] + row["Close"]) / 4.0)
+            return (open_p + high_p + low_p + close_p) / 4.0
         elif exec_mode == "hl2":
-            return float((row["High"] + row["Low"]) / 2.0)
+            return (high_p + low_p) / 2.0
         elif exec_mode == "typical":
-            return float((row["High"] + row["Low"] + row["Close"]) / 3.0)
+            return (high_p + low_p + close_p) / 3.0
         else:
             # default fallback
-            return float(row["Open"] if exec_mode == "open" else row["Close"])
+            return open_p if exec_mode == "open" else close_p
 
     def _get_tick_size(
         self, price: float, exchange: str, current_time: pd.Timestamp = None
@@ -513,511 +510,11 @@ class BacktestEngine:
                 active_cash_settlements.append(item)
         self.cash_settlement_queue = active_cash_settlements
 
-    def _process_corporate_actions(self, current_time: pd.Timestamp, current_idx: int):
-        """Process stock splits, stock dividends, and cash dividends."""
-        if self.dividends_already_factored:
-            return
-        # 1. Check pending cash dividends payout
-        active_pending = []
-        for item in self.pending_dividends:
-            payout_dt = item["payout_date"]
-            if payout_dt.tz is not None:
-                payout_dt = payout_dt.tz_localize(None)
-            if current_time.normalize() >= payout_dt.normalize():
-                amount = item["amount"]
-                tax = amount * self.dividend_tax_rate
-                net_amount = amount - tax
-
-                self.cash += net_amount
-
-                # Log trade record
-                self.trades_history.append(
-                    {
-                        "Date": current_time,
-                        "Ticker": item["ticker"],
-                        "Action": "DIVIDEND_CASH",
-                        "Quantity": 0,
-                        "Price": 0.0,
-                        "Value": amount,
-                        "Fee": 0.0,
-                        "Tax": tax,
-                        "TotalValue": net_amount,
-                        "TimePlaced": current_time,
-                        "Note": f"Nhận cổ tức tiền mặt cho {item['ticker']} (Tổng: {amount:,.0f} VND, Thuế {self.dividend_tax_rate*100:.1f}%: {tax:,.0f} VND, Thực nhận: {net_amount:,.0f} VND)",
-                    }
-                )
-                self.order_logs.append(
-                    {
-                        "Date": current_time,
-                        "Ticker": item["ticker"],
-                        "Action": "DIVIDEND_PAID",
-                        "Reason": f"Nhận cổ tức tiền mặt ({amount:,.0f}đ, sau thuế {self.dividend_tax_rate*100:.1f}%: {net_amount:,.0f}đ)",
-                        "Price": 0.0,
-                        "Quantity": 0,
-                    }
-                )
-            else:
-                active_pending.append(item)
-        self.pending_dividends = active_pending
-
-        # 2. Check for new ex-right events today
-        for ticker in self.data:
-            actions_df = self.corporate_actions.get(ticker, None)
-            if actions_df is None or actions_df.empty:
-                continue
-
-            # Filter events on this day (normalized to ignore time component)
-            if actions_df["exright_date"].dt.tz is not None:
-                actions_df["exright_date"] = actions_df["exright_date"].dt.tz_localize(
-                    None
-                )
-            events_today = actions_df[
-                actions_df["exright_date"].dt.normalize() == current_time.normalize()
-            ]
-            for _, event in events_today.iterrows():
-                qty = self.positions.get(ticker, 0)
-                if qty <= 0:
-                    continue
-
-                val_per_share = event.get("value_per_share")
-                exercise_ratio = event.get("exercise_ratio")
-                event_name = event.get("event_name_vi", "")
-                event_title = (
-                    event.get("event_title_vi", "")
-                    if "event_title_vi" in event.index
-                    else ""
-                )
-
-                # Check for Cash Dividend
-                is_cash_div = False
-                if pd.notna(val_per_share) and val_per_share > 0:
-                    is_cash_div = True
-                elif (
-                    "tiền mặt" in str(event_name).lower()
-                    or "tiền mặt" in str(event_title).lower()
-                ):
-                    is_cash_div = True
-                    if pd.isna(val_per_share) or val_per_share == 0:
-                        # Fallback: estimate 10% par value if exercise_ratio is present
-                        if pd.notna(exercise_ratio) and exercise_ratio > 0:
-                            val_per_share = exercise_ratio * 10000.0
-                        else:
-                            val_per_share = 1000.0  # Standard fallback
-
-                if is_cash_div:
-                    payout_val = val_per_share if pd.notna(val_per_share) else 1000.0
-                    dividend_cash = qty * payout_val
-                    payout_date = event.get("payout_date")
-                    if pd.isna(payout_date) or payout_date is None:
-                        payout_date = current_time + pd.Timedelta(days=15)
-                    else:
-                        payout_date = pd.to_datetime(payout_date)
-                        if payout_date.tz is not None:
-                            payout_date = payout_date.tz_localize(None)
-
-                    self.pending_dividends.append(
-                        {
-                            "amount": dividend_cash,
-                            "payout_date": payout_date,
-                            "ticker": ticker,
-                        }
-                    )
-
-                    self.order_logs.append(
-                        {
-                            "Date": current_time,
-                            "Ticker": ticker,
-                            "Action": "DIVIDEND_ACCRUED",
-                            "Reason": f"Chốt quyền nhận cổ tức tiền mặt ({payout_val:,.0f}đ/CP, thanh toán ngày {payout_date.strftime('%d/%m/%Y')})",
-                            "Price": payout_val,
-                            "Quantity": qty,
-                        }
-                    )
-
-                    # Adjust risk management prices for cash dividend ex-rights price drop
-                    close_prev = (
-                        self.data[ticker].iloc[current_idx - 1]["Close"]
-                        if current_idx > 0
-                        else payout_val
-                    )
-                    if close_prev > payout_val:
-                        factor = (close_prev - payout_val) / close_prev
-                        if ticker in self.position_entry_price:
-                            self.position_entry_price[ticker] *= factor
-                        if ticker in self.position_highest_price:
-                            self.position_highest_price[ticker] *= factor
-
-                # Check for Rights Offering (Quyền mua phát hành thêm)
-                elif (
-                    "quyền mua" in str(event_title).lower()
-                    or "quyền mua" in str(event_name).lower()
-                ):
-                    ratio = exercise_ratio if pd.notna(exercise_ratio) else 0.0
-                    if ratio > 0:
-                        # Adjust risk management prices for dilution from rights issue ex-rights price drop
-                        close_prev = (
-                            self.data[ticker].iloc[current_idx - 1]["Close"]
-                            if current_idx > 0
-                            else 10000.0
-                        )
-                        if close_prev > 10000.0:
-                            factor = (close_prev + ratio * 10000.0) / (
-                                close_prev * (1.0 + ratio)
-                            )
-                            if ticker in self.position_entry_price:
-                                self.position_entry_price[ticker] *= factor
-                            if ticker in self.position_highest_price:
-                                self.position_highest_price[ticker] *= factor
-
-                        new_shares = int(qty * ratio)
-                        if new_shares > 0:
-                            # Check if market price is above subscription price (usually 10,000 VND)
-                            subscription_price = 10000.0
-                            ticker_df = self.data[ticker]
-                            current_price = (
-                                ticker_df.loc[current_time, "Close"]
-                                if current_time in ticker_df.index
-                                else subscription_price
-                            )
-
-                            if current_price > subscription_price:
-                                cash_needed = new_shares * subscription_price
-
-                                # Check cash restriction
-                                can_exercise = True
-                                if self.margin_ratio >= 1.0 and cash_needed > self.cash:
-                                    # Limit new shares to cash capacity if margin not allowed
-                                    max_buyable = int(self.cash // subscription_price)
-                                    if max_buyable > 0:
-                                        new_shares = min(new_shares, max_buyable)
-                                        cash_needed = new_shares * subscription_price
-                                    else:
-                                        can_exercise = False
-
-                                if can_exercise:
-                                    # Determine unlock date (usually listing date or self.rights_listing_delay days)
-                                    unlock_date = event.get("listing_date")
-                                    if pd.isna(unlock_date) or unlock_date is None:
-                                        unlock_date = event.get("payout_date")
-                                    if pd.isna(unlock_date) or unlock_date is None:
-                                        unlock_date = current_time + pd.Timedelta(
-                                            days=self.rights_listing_delay
-                                        )
-                                    else:
-                                        unlock_date = pd.to_datetime(unlock_date)
-                                        if unlock_date.tz is not None:
-                                            unlock_date = unlock_date.tz_localize(None)
-
-                                    unlock_idx = current_idx + int(
-                                        self.rights_listing_delay * 5 / 7
-                                    )
-                                    for future_idx in range(
-                                        current_idx, len(self.dates)
-                                    ):
-                                        target_dt = self.dates[future_idx]
-                                        if target_dt.tz is not None:
-                                            target_dt = target_dt.tz_localize(None)
-                                        if target_dt >= unlock_date:
-                                            unlock_idx = future_idx
-                                            break
-
-                                    self.positions[ticker] = (
-                                        self.positions.get(ticker, 0) + new_shares
-                                    )
-
-                                    self.settlement_queue.append(
-                                        {
-                                            "ticker": ticker,
-                                            "quantity": new_shares,
-                                            "settle_idx": unlock_idx,
-                                        }
-                                    )
-
-                                    self.trades_history.append(
-                                        {
-                                            "Date": current_time,
-                                            "Ticker": ticker,
-                                            "Action": "RIGHTS_EXERCISED",
-                                            "Quantity": new_shares,
-                                            "Price": subscription_price,
-                                            "Value": cash_needed,
-                                            "Fee": 0.0,
-                                            "Tax": 0.0,
-                                            "TotalValue": cash_needed,
-                                            "TimePlaced": current_time,
-                                            "Note": f"Thực hiện quyền mua tỉ lệ {ratio*100:.1f}% giá {subscription_price:,.0f}đ (-{cash_needed:,.0f} VND, +{new_shares} CP, mở khóa ngày {self.dates[min(unlock_idx, len(self.dates)-1)].strftime('%d/%m/%Y')})",
-                                        }
-                                    )
-                                    self.order_logs.append(
-                                        {
-                                            "Date": current_time,
-                                            "Ticker": ticker,
-                                            "Action": "RIGHTS_EXERCISED",
-                                            "Reason": f"Thực hiện quyền mua (+{new_shares} CP @ {subscription_price:,.0f}đ)",
-                                            "Price": subscription_price,
-                                            "Quantity": new_shares,
-                                        }
-                                    )
-                                else:
-                                    self.order_logs.append(
-                                        {
-                                            "Date": current_time,
-                                            "Ticker": ticker,
-                                            "Action": "RIGHTS_LAPSED",
-                                            "Reason": "Insufficient cash to exercise rights",
-                                            "Price": subscription_price,
-                                            "Quantity": 0,
-                                        }
-                                    )
-                            else:
-                                self.order_logs.append(
-                                    {
-                                        "Date": current_time,
-                                        "Ticker": ticker,
-                                        "Action": "RIGHTS_LAPSED",
-                                        "Reason": f"Market price ({current_price:,.0f}đ) <= rights price ({subscription_price:,.0f}đ)",
-                                        "Price": subscription_price,
-                                        "Quantity": 0,
-                                    }
-                                )
-                # Check for Stock Dividend / Share Issue (free)
-                else:
-                    ratio = exercise_ratio if pd.notna(exercise_ratio) else 0.0
-                    if ratio > 0:
-                        # Adjust risk management prices for stock dividend ex-rights price drop
-                        factor = 1.0 / (1.0 + ratio)
-                        if ticker in self.position_entry_price:
-                            self.position_entry_price[ticker] *= factor
-                        if ticker in self.position_highest_price:
-                            self.position_highest_price[ticker] *= factor
-
-                        new_shares = int(qty * ratio)
-                        if new_shares > 0:
-                            self.positions[ticker] = (
-                                self.positions.get(ticker, 0) + new_shares
-                            )
-                            self.dividend_shares[ticker] = (
-                                self.dividend_shares.get(ticker, 0) + new_shares
-                            )
-
-                            # Determine unlock date
-                            unlock_date = event.get("listing_date")
-                            if pd.isna(unlock_date) or unlock_date is None:
-                                unlock_date = event.get("payout_date")
-                            if pd.isna(unlock_date) or unlock_date is None:
-                                unlock_date = current_time + pd.Timedelta(
-                                    days=self.rights_listing_delay
-                                )
-                            else:
-                                unlock_date = pd.to_datetime(unlock_date)
-                                if unlock_date.tz is not None:
-                                    unlock_date = unlock_date.tz_localize(None)
-
-                            # Map unlock_date to trading day index
-                            unlock_idx = current_idx + int(
-                                self.rights_listing_delay * 5 / 7
-                            )
-                            for future_idx in range(current_idx, len(self.dates)):
-                                target_dt = self.dates[future_idx]
-                                if target_dt.tz is not None:
-                                    target_dt = target_dt.tz_localize(None)
-                                if target_dt >= unlock_date:
-                                    unlock_idx = future_idx
-                                    break
-
-                            self.settlement_queue.append(
-                                {
-                                    "ticker": ticker,
-                                    "quantity": new_shares,
-                                    "settle_idx": unlock_idx,
-                                }
-                            )
-
-                            self.trades_history.append(
-                                {
-                                    "Date": current_time,
-                                    "Ticker": ticker,
-                                    "Action": "DIVIDEND_STOCK",
-                                    "Quantity": new_shares,
-                                    "Price": 0.0,
-                                    "Value": 0.0,
-                                    "Fee": 0.0,
-                                    "Tax": 0.0,
-                                    "TotalValue": 0.0,
-                                    "TimePlaced": current_time,
-                                    "Note": f"Nhận cổ tức cổ phiếu tỉ lệ {ratio*100:.1f}% (+{new_shares} CP, mở khóa ngày {self.dates[min(unlock_idx, len(self.dates)-1)].strftime('%d/%m/%Y')})",
-                                }
-                            )
-                            self.order_logs.append(
-                                {
-                                    "Date": current_time,
-                                    "Ticker": ticker,
-                                    "Action": "DIVIDEND_STOCK_FILLED",
-                                    "Reason": f"Nhận cổ tức cổ phiếu (+{new_shares} CP)",
-                                    "Price": 0.0,
-                                    "Quantity": new_shares,
-                                }
-                            )
-
     def _apply_dynamic_rules(self, current_time: pd.Timestamp):
         """Apply VN historical trading rules based on the date."""
         self.settlement_days = self.rules.apply_dynamic_rules(
             current_time, self.execution_at
         )
-
-    def _detect_if_adjusted(self) -> bool:
-        """
-        Detect if the input data is already adjusted for splits and dividends.
-        We check all historical stock splits/dividends and count how many
-        expected price drops are present.
-        """
-        if not self.adjust_corporate_actions:
-            return True
-
-        unadjusted_count = 0
-        adjusted_count = 0
-
-        for ticker, df in self.data.items():
-            events = self.corporate_actions.get(ticker)
-            if events is None or events.empty:
-                continue
-
-            # Find stock dividends / splits with a significant ratio (> 0.05)
-            splits = events[events["exercise_ratio"] > 0.05]
-            df_dates_normalized = df.index.normalize()
-
-            for _, event in splits.iterrows():
-                if pd.isna(event["exright_date"]):
-                    continue
-                ex_date = pd.to_datetime(event["exright_date"]).normalize()
-                if ex_date in df_dates_normalized:
-                    idx_ex = df_dates_normalized.get_loc(ex_date)
-                    if idx_ex > 0:
-                        close_prev = df["Close"].iloc[idx_ex - 1]
-                        close_ex = df["Close"].iloc[idx_ex]
-                        ratio = close_ex / close_prev
-                        expected_ratio = 1.0 / (1.0 + event["exercise_ratio"])
-
-                        # Price ratio matches expected price drop (unadjusted)
-                        # We allow a wider tolerance of 12% to avoid noise from normal price moves on ex-date
-                        if abs(ratio - expected_ratio) < 0.12:
-                            unadjusted_count += 1
-                        # Price ratio is close to 1.0 (adjusted, meaning no drop)
-                        elif abs(ratio - 1.0) < 0.05:
-                            adjusted_count += 1
-
-        # If we detected more unadjusted events than adjusted, it's unadjusted
-        if unadjusted_count > 0 or adjusted_count > 0:
-            logger.info(
-                f"Phân tích dữ liệu: phát hiện {unadjusted_count} sự kiện CHƯA điều chỉnh "
-                f"và {adjusted_count} sự kiện ĐÃ điều chỉnh."
-            )
-            return adjusted_count >= unadjusted_count
-
-        # Default to True if no events found
-        return True
-
-    def _calculate_adjusted_prices(self):
-        """
-        Calculate adjusted price columns for all tickers.
-        If the input price data is already adjusted, we just copy the raw columns.
-        If the input data is unadjusted, we use the backward CRSP adjustment algorithm.
-        """
-        for ticker, df in self.data.items():
-            if self.dividends_already_factored:
-                # Copy raw columns
-                df["Adj_Open"] = df["Open"]
-                df["Adj_High"] = df["High"]
-                df["Adj_Low"] = df["Low"]
-                df["Adj_Close"] = df["Close"]
-                if "Average" in df.columns:
-                    df["Adj_Average"] = df["Average"]
-            else:
-                # Initialize adjusted columns with raw values
-                df["Adj_Open"] = df["Open"].astype(float)
-                df["Adj_High"] = df["High"].astype(float)
-                df["Adj_Low"] = df["Low"].astype(float)
-                df["Adj_Close"] = df["Close"].astype(float)
-                if "Average" in df.columns:
-                    df["Adj_Average"] = df["Average"].astype(float)
-
-                events = self.corporate_actions.get(ticker)
-                if events is None or events.empty:
-                    continue
-
-                events_sorted = events.sort_values("exright_date", ascending=False)
-                multipliers = pd.Series(1.0, index=df.index)
-
-                for _, event in events_sorted.iterrows():
-                    if pd.isna(event["exright_date"]):
-                        continue
-                    ex_date = pd.to_datetime(event["exright_date"]).normalize()
-                    past_dates = df.index[df.index < ex_date]
-                    if past_dates.empty:
-                        continue
-
-                    factor = 1.0
-                    val_per_share = event.get("value_per_share")
-                    exercise_ratio = event.get("exercise_ratio")
-                    event_name = event.get("event_name_vi", "")
-                    event_title = (
-                        event.get("event_title_vi", "")
-                        if "event_title_vi" in event.index
-                        else ""
-                    )
-
-                    is_cash_div = False
-                    if pd.notna(val_per_share) and val_per_share > 0:
-                        is_cash_div = True
-                    elif (
-                        "tiền mặt" in str(event_name).lower()
-                        or "tiền mặt" in str(event_title).lower()
-                    ):
-                        is_cash_div = True
-                        if pd.isna(val_per_share) or val_per_share == 0:
-                            if pd.notna(exercise_ratio) and exercise_ratio > 0:
-                                val_per_share = exercise_ratio * 10000.0
-                            else:
-                                val_per_share = 1000.0
-
-                    is_rights_issue = False
-                    if (
-                        "quyền mua" in str(event_title).lower()
-                        or "quyền mua" in str(event_name).lower()
-                    ):
-                        is_rights_issue = True
-
-                    if is_cash_div:
-                        idx_prev_date = past_dates[-1]
-                        close_prev = df.loc[idx_prev_date, "Close"]
-                        net_div = val_per_share
-                        if close_prev > net_div:
-                            factor = (close_prev - net_div) / close_prev
-                    elif is_rights_issue:
-                        ratio = exercise_ratio if pd.notna(exercise_ratio) else 0.0
-                        if ratio > 0:
-                            idx_prev_date = past_dates[-1]
-                            close_prev = df.loc[idx_prev_date, "Close"]
-                            subscription_price = 10000.0
-                            if close_prev > subscription_price:
-                                factor = (
-                                    1.0 + ratio * (subscription_price / close_prev)
-                                ) / (1.0 + ratio)
-                            else:
-                                factor = 1.0
-                    else:
-                        ratio = exercise_ratio if pd.notna(exercise_ratio) else 0.0
-                        if ratio > 0:
-                            factor = 1.0 / (1.0 + ratio)
-
-                    multipliers.loc[past_dates] *= factor
-
-                df["Adj_Open"] = df["Adj_Open"] * multipliers
-                df["Adj_High"] = df["Adj_High"] * multipliers
-                df["Adj_Low"] = df["Adj_Low"] * multipliers
-                df["Adj_Close"] = df["Adj_Close"] * multipliers
-                if "Average" in df.columns:
-                    df["Adj_Average"] = df["Adj_Average"] * multipliers
 
     def run(self) -> Dict[str, Any]:
         """Run the backtest simulation."""
@@ -1029,9 +526,23 @@ class BacktestEngine:
 
         # Pre-compute previous-bar reference prices and close prices to avoid
         # O(N²) DataFrame slicing (`ticker_df[:current_time]`) inside the loop.
-        self._prev_ref_cache: Dict[str, pd.Series] = {}
-        self._prev_close_cache: Dict[str, pd.Series] = {}
+        self._prev_ref_cache: Dict[str, np.ndarray] = {}
+        self._prev_close_cache: Dict[str, np.ndarray] = {}
+        self._price_arrays: Dict[str, Dict[str, np.ndarray]] = {}
+
         for ticker, ticker_df in self.data.items():
+            # Cache OHLCV arrays for fast lookup
+            self._price_arrays[ticker] = {
+                "Open": ticker_df["Open"].values,
+                "High": ticker_df["High"].values,
+                "Low": ticker_df["Low"].values,
+                "Close": ticker_df["Close"].values,
+                "Volume": ticker_df["Volume"].values,
+                "Traded": ticker_df["Traded"].values if "Traded" in ticker_df.columns else np.ones(len(ticker_df)),
+            }
+            if "Average" in ticker_df.columns:
+                self._price_arrays[ticker]["Average"] = ticker_df["Average"].values
+
             exch = self.exchanges.get(ticker, "hose")
             if exch == "upcom":
                 if "Average" in ticker_df.columns:
@@ -1054,8 +565,8 @@ class BacktestEngine:
                     ) / 4.0
             else:
                 ref = ticker_df["Close"]
-            self._prev_ref_cache[ticker] = ref.shift(1)
-            self._prev_close_cache[ticker] = ticker_df["Close"].shift(1)
+            self._prev_ref_cache[ticker] = ref.shift(1).values
+            self._prev_close_cache[ticker] = ticker_df["Close"].shift(1).values
 
         # Main simulation loop
         for idx in range(n_bars):
@@ -1074,17 +585,19 @@ class BacktestEngine:
 
             # 2.5 Process corporate actions today if enabled
             if self.adjust_corporate_actions:
-                self._process_corporate_actions(current_time, idx)
+                self.corporate_processor.process_corporate_actions(current_time, idx)
 
             # 2.6 Auto-liquidation for delisted / last active day stocks
-            if hasattr(self, "last_active_dates"):
-                for ticker, last_active_date in self.last_active_dates.items():
-                    if current_time.normalize() == last_active_date.normalize():
-                        qty = self.positions.get(ticker, 0)
-                        if qty > 0:
+            current_date = current_time.normalize()
+            if hasattr(self, "tickers_by_last_active_date") and current_date in self.tickers_by_last_active_date:
+                for ticker in self.tickers_by_last_active_date[current_date]:
+                    qty = self.positions.get(ticker, 0)
+                    if qty > 0:
                             # Force sell at close price of the last active day
-                            ticker_df = self.data[ticker]
-                            close_price = ticker_df.loc[current_time, "Close"]
+                            close_price = self._price_arrays[ticker]["Close"][idx]
+                            if pd.isna(close_price):
+                                close_val = self._prev_close_cache[ticker][idx]
+                                close_price = 0.0 if pd.isna(close_val) else float(close_val)
 
                             trade_value = qty * close_price
                             fee = trade_value * self.sell_fee
@@ -1168,128 +681,32 @@ class BacktestEngine:
             self._check_risk_management(strategy, current_time, idx)
 
             # 3. Execute pending orders placed on previous day
-            # Reference prices for limits are the Close of previous day (or Weighted Average for UPCoM)
-            # PERF: O(1) lookup using precomputed shifted reference prices cache
-            prev_closes = {}
-            for ticker in self.data:
-                cached_val = self._prev_ref_cache[ticker].get(current_time)
-                if cached_val is not None and not pd.isna(cached_val):
-                    prev_closes[ticker] = float(cached_val)
-                else:
-                    prev_closes[ticker] = None
-
-            self._execute_orders(current_time, prev_closes, idx)
+            self._execute_orders(current_time, idx)
 
             # 4. Calculate portfolio equity at current Close
             # PERF: O(1) lookup using precomputed shifted close prices cache for valuation fallback
             positions_value = 0.0
             for ticker, qty in self.positions.items():
-                ticker_df = self.data[ticker]
-                if current_time in ticker_df.index:
-                    close_price = ticker_df.loc[current_time, "Close"]
-                else:
-                    close_val = (
-                        self._prev_close_cache[ticker].get(current_time, 0.0) or 0.0
-                    )
+                close_price = self._price_arrays[ticker]["Close"][idx]
+                if pd.isna(close_price):
+                    close_val = self._prev_close_cache[ticker][idx]
                     close_price = 0.0 if pd.isna(close_val) else float(close_val)
                 positions_value += qty * close_price
 
             equity = self.cash + positions_value
 
+            if equity < 0:
+                self.is_bankrupt = True
+                logger.critical(
+                    f"🚨 [BANKRUPTCY] Tài khoản bị âm tài sản ròng tại ngày {current_time.strftime('%d/%m/%Y')}! "
+                    f"Equity: {equity:,.0f} VND (Tiền mặt: {self.cash:,.0f} VND, Giá trị danh mục: {positions_value:,.0f} VND)"
+                )
+
             # 4.1 Daily Margin Interest Check
-            # Calculate settled cash (excluding pending cash from sells that hasn't settled yet)
-            pending_cash = sum(
-                item["amount"] - item.get("borrowed", 0.0)
-                for item in self.cash_settlement_queue
-            )
-            settled_cash = self.cash - pending_cash
-
-            if settled_cash < 0:
-                # Calculate actual calendar days elapsed since the previous trading day
-                days_diff = 1
-                if idx > 0:
-                    days_diff = (self.dates[idx] - self.dates[idx - 1]).days
-                    if days_diff <= 0:
-                        days_diff = 1
-                interest = (
-                    abs(settled_cash) * (self.margin_interest_rate / 365.0) * days_diff
-                )
-                self.cash -= interest
-                equity -= interest
-
-                self.trades_history.append(
-                    {
-                        "Date": current_time,
-                        "Ticker": "MARGIN",
-                        "Action": "MARGIN_INTEREST",
-                        "Quantity": 0,
-                        "Price": 0.0,
-                        "Value": interest,
-                        "Fee": interest,
-                        "Tax": 0.0,
-                        "TotalValue": interest,
-                        "TimePlaced": current_time,
-                        "Note": f"Lãi vay Margin ({days_diff} ngày): {interest:,.0f} VND (Dư nợ thực tế: {abs(settled_cash):,.0f} VND, Chờ về: {pending_cash:,.0f} VND)",
-                    }
-                )
+            equity = self.margin_manager.check_margin_interest(current_time, idx, equity)
 
             # 4.2 Margin Maintenance Ratio Check (Force Sell liquidation)
-            if positions_value > 0 and self.margin_ratio < 1.0:
-                current_margin_ratio = equity / positions_value
-                if current_margin_ratio < self.margin_maintenance_ratio:
-                    # Calculate required liquidation value
-                    target_ratio = self.margin_maintenance_ratio + 0.02
-                    value_to_sell = (target_ratio * positions_value - equity) / (
-                        target_ratio - self.sell_fee - self.sell_tax
-                    )
-                    value_to_sell = min(value_to_sell, positions_value)
-
-                    self.order_logs.append(
-                        {
-                            "Date": current_time,
-                            "Ticker": "PORTFOLIO",
-                            "Action": "MARGIN_CALL",
-                            "Reason": f"Tỷ lệ ký quỹ ({current_margin_ratio*100:.2f}%) < {self.margin_maintenance_ratio*100:.2f}%. Yêu cầu giải chấp khoảng {value_to_sell:,.0f} VND.",
-                            "Price": 0.0,
-                            "Quantity": 0,
-                        }
-                    )
-
-                    for ticker, qty in list(self.positions.items()):
-                        # Proportional sell
-                        ticker_df = self.data[ticker]
-                        if current_time in ticker_df.index:
-                            close_price = ticker_df.loc[current_time, "Close"]
-                        else:
-                            close_val = (
-                                self._prev_close_cache[ticker].get(current_time, 0.0)
-                                or 0.0
-                            )
-                            close_price = (
-                                0.0 if pd.isna(close_val) else float(close_val)
-                            )
-
-                        if close_price > 0:
-                            qty_to_sell = qty * (value_to_sell / positions_value)
-                            lot_size = self._get_lot_size(ticker, current_time)
-                            effective_lot_size = (
-                                1
-                                if self._is_odd_lot_allowed(ticker, current_time)
-                                else lot_size
-                            )
-                            if effective_lot_size and effective_lot_size > 0:
-                                qty_to_sell = (
-                                    int(np.ceil(qty_to_sell / effective_lot_size))
-                                    * effective_lot_size
-                                )
-                            else:
-                                qty_to_sell = int(np.ceil(qty_to_sell))
-
-                            qty_to_sell = min(qty_to_sell, qty)
-                            if qty_to_sell > 0:
-                                self.place_sell_order(
-                                    ticker, size=qty_to_sell, time=current_time
-                                )
+            self.margin_manager.check_margin_maintenance(current_time, idx, positions_value, equity)
 
             # Save history
             history_record = {
@@ -1301,12 +718,14 @@ class BacktestEngine:
             # Record individual ticker valuations for portfolio analysis
             for t in self.data:
                 q = self.positions.get(t, 0)
-                if current_time in self.data[t].index:
-                    c_price = self.data[t].loc[current_time, "Close"]
+                if q > 0:
+                    c_price = self._price_arrays[t]["Close"][idx]
+                    if pd.isna(c_price):
+                        c_val = self._prev_close_cache[t][idx]
+                        c_price = 0.0 if pd.isna(c_val) else float(c_val)
+                    history_record[f"Val_{t}"] = q * c_price
                 else:
-                    c_val = self._prev_close_cache[t].get(current_time, 0.0) or 0.0
-                    c_price = 0.0 if pd.isna(c_val) else float(c_val)
-                history_record[f"Val_{t}"] = q * c_price
+                    history_record[f"Val_{t}"] = 0.0
             self.portfolio_history.append(history_record)
 
             # 5. Call strategy's next() to make new trading decisions
@@ -1320,12 +739,10 @@ class BacktestEngine:
             active_tickers = [t for t, q in self.positions.items() if q > 0]
             for ticker in active_tickers:
                 qty = self.positions[ticker]
-                ticker_df = self.data[ticker]
-                close_price = (
-                    ticker_df.loc[last_date, "Close"]
-                    if last_date in ticker_df.index
-                    else ticker_df.iloc[-1]["Close"]
-                )
+                close_price = self._price_arrays[ticker]["Close"][-1]
+                if pd.isna(close_price):
+                    close_val = self._prev_close_cache[ticker][-1]
+                    close_price = 0.0 if pd.isna(close_val) else float(close_val)
 
                 # Apply transaction fee and tax
                 trade_value = qty * close_price
@@ -1403,12 +820,12 @@ class BacktestEngine:
                 if not equity_df.empty
                 else self.initial_cash
             ),
+            "is_bankrupt": self.is_bankrupt,
         }
 
     def _execute_orders(
         self,
         current_time: pd.Timestamp,
-        prev_closes: Dict[str, float],
         current_idx: int,
     ):
         """Execute orders queued on the previous bar."""
@@ -1423,6 +840,17 @@ class BacktestEngine:
             orders_to_process, key=lambda x: 0 if x.action == "sell" else 1
         )
         self._current_executing_orders = sorted_orders
+
+        # Build prev_closes only for the tickers that have pending orders
+        prev_closes = {}
+        for order in sorted_orders:
+            ticker = order.ticker
+            if ticker not in prev_closes:
+                cached_val = self._prev_ref_cache[ticker][current_idx]
+                if cached_val is not None and not pd.isna(cached_val):
+                    prev_closes[ticker] = float(cached_val)
+                else:
+                    prev_closes[ticker] = None
 
         for order in sorted_orders:
             # Skip executing orders placed on the current bar (they will execute on the next bar)
@@ -1465,10 +893,36 @@ class BacktestEngine:
             action = order.action
             qty = order.remaining_quantity
             time_placed = order.time_placed
+            is_partial_fill_touch = False
 
-            # Check if ticker traded on current_time
-            ticker_df = self.data[ticker]
-            if current_time not in ticker_df.index:
+            # Check if ticker traded on current_time (idx)
+            if ticker not in self._price_arrays:
+                # Ticker data not found, cancel order
+                order.status = OrderStatus.CANCELLED
+                self.order_logs.append(
+                    {
+                        "Date": current_time,
+                        "Ticker": ticker,
+                        "Action": f"{order.order_type}_CANCELLED",
+                        "Reason": "Ticker data not available in engine",
+                        "Price": 0.0,
+                        "Quantity": order.quantity,
+                    }
+                )
+                continue
+
+            ticker_arrays = self._price_arrays[ticker]
+            # Since index is normalized and unified, we check if current_idx is valid
+            if current_idx >= len(ticker_arrays["Open"]):
+                # Out of bounds
+                continue
+
+            # Check for zero volume or NaN volume (suspended trading or illiquid) or not traded today
+            vol = ticker_arrays["Volume"][current_idx]
+            traded = ticker_arrays["Traded"][current_idx]
+
+            # If not traded today (pre-debut or post-delisting)
+            if pd.isna(vol) or traded == 0:
                 if order.order_type in ["ATO", "ATC"]:
                     order.status = OrderStatus.CANCELLED
                     self.order_logs.append(
@@ -1486,11 +940,17 @@ class BacktestEngine:
                     self.pending_orders.append(order)
                 continue
 
-            row = ticker_df.loc[current_time]
-            # Check for zero volume or NaN volume (suspended trading or illiquid) or not traded today
-            if ("Traded" in row and row["Traded"] == 0) or (
-                "Volume" in row and (pd.isna(row["Volume"]) or row["Volume"] <= 0)
-            ):
+            # Check for zero volume or NaN volume or if it violates minimum daily volume (illiquid/suspended trading)
+            is_illiquid = False
+            reason_msg = ""
+            if vol <= 0:
+                is_illiquid = True
+                reason_msg = "Zero trading volume or suspended trading on execution day"
+            elif self.min_daily_volume is not None and vol < self.min_daily_volume:
+                is_illiquid = True
+                reason_msg = f"Daily trading volume ({vol:,.0f}) below minimum threshold ({self.min_daily_volume:,.0f})"
+
+            if is_illiquid:
                 if order.order_type in ["ATO", "ATC"]:
                     order.status = OrderStatus.CANCELLED
                     self.order_logs.append(
@@ -1498,20 +958,20 @@ class BacktestEngine:
                             "Date": current_time,
                             "Ticker": ticker,
                             "Action": f"{order.order_type}_CANCELLED",
-                            "Reason": "Zero trading volume or suspended trading on execution day",
+                            "Reason": reason_msg,
                             "Price": 0.0,
                             "Quantity": order.quantity,
                         }
                     )
                 else:
-                    # Keep order pending if ticker didn't trade
+                    # Keep order pending if ticker didn't trade or is illiquid today
                     self.pending_orders.append(order)
                     self.order_logs.append(
                         {
                             "Date": current_time,
                             "Ticker": ticker,
                             "Action": f"{action.upper()}_DEFERRED",
-                            "Reason": "Zero trading volume or suspended trading",
+                            "Reason": reason_msg,
                             "Price": 0.0,
                             "Quantity": 0,
                         }
@@ -1519,6 +979,11 @@ class BacktestEngine:
                 continue
 
             prev_close = prev_closes.get(ticker)
+
+            open_p = float(ticker_arrays["Open"][current_idx])
+            high_p = float(ticker_arrays["High"][current_idx])
+            low_p = float(ticker_arrays["Low"][current_idx])
+            close_p = float(ticker_arrays["Close"][current_idx])
 
             # Check if today is the listing day
             is_listing_day = False
@@ -1530,9 +995,7 @@ class BacktestEngine:
                     is_listing_day = True
 
             if is_listing_day:
-                prev_close = float(
-                    row["Open"]
-                )  # Use Open price as reference on listing day
+                prev_close = open_p  # Use Open price as reference on listing day
 
             exch = self.exchanges.get(ticker, "hose")
             lot_size = self._get_lot_size(ticker, current_time)
@@ -1545,20 +1008,20 @@ class BacktestEngine:
 
             # Determine base price and execution type
             if order.order_type == "ATO":
-                base_price = float(row["Open"])
+                base_price = open_p
             elif order.order_type == "ATC":
-                base_price = float(row["Close"])
+                base_price = close_p
             # Check Stop Order condition
             elif order.stop_price is not None:
                 stop_triggered = False
                 if action == "buy":
-                    if row["High"] >= order.stop_price:
+                    if high_p >= order.stop_price:
                         stop_triggered = True
-                        base_price = max(row["Open"], order.stop_price)
+                        base_price = max(open_p, order.stop_price)
                 elif action == "sell":
-                    if row["Low"] <= order.stop_price:
+                    if low_p <= order.stop_price:
                         stop_triggered = True
-                        base_price = min(row["Open"], order.stop_price)
+                        base_price = min(open_p, order.stop_price)
 
                 if not stop_triggered:
                     self.pending_orders.append(order)
@@ -1566,15 +1029,28 @@ class BacktestEngine:
 
                 # If stop triggered and limit_price is present, check limit condition
                 if order.limit_price is not None:
+                    limit_price = order.limit_price
                     if action == "buy":
-                        if row["Low"] <= order.limit_price:
-                            base_price = min(base_price, order.limit_price)
+                        if low_p < limit_price:
+                            base_price = min(base_price, limit_price)
+                        elif low_p == limit_price:
+                            if self.limit_order_fill_policy == "conservative":
+                                is_partial_fill_touch = True
+                                base_price = limit_price
+                            else:
+                                base_price = min(base_price, limit_price)
                         else:
                             self.pending_orders.append(order)
                             continue
                     elif action == "sell":
-                        if row["High"] >= order.limit_price:
-                            base_price = max(base_price, order.limit_price)
+                        if high_p > limit_price:
+                            base_price = max(base_price, limit_price)
+                        elif high_p == limit_price:
+                            if self.limit_order_fill_policy == "conservative":
+                                is_partial_fill_touch = True
+                                base_price = limit_price
+                            else:
+                                base_price = max(base_price, limit_price)
                         else:
                             self.pending_orders.append(order)
                             continue
@@ -1582,21 +1058,50 @@ class BacktestEngine:
             elif order.limit_price is not None:
                 limit_price = order.limit_price
                 if action == "buy":
-                    if row["Low"] <= limit_price:
-                        base_price = min(row["Open"], limit_price)
+                    if low_p < limit_price:
+                        base_price = min(open_p, limit_price)
+                    elif low_p == limit_price:
+                        if self.limit_order_fill_policy == "conservative":
+                            is_partial_fill_touch = True
+                            base_price = limit_price
+                        else:
+                            base_price = min(open_p, limit_price)
                     else:
                         # Price did not reach buy limit, defer to next trading day
                         self.pending_orders.append(order)
                         continue
                 elif action == "sell":
-                    if row["High"] >= limit_price:
-                        base_price = max(row["Open"], limit_price)
+                    if high_p > limit_price:
+                        base_price = max(open_p, limit_price)
+                    elif high_p == limit_price:
+                        if self.limit_order_fill_policy == "conservative":
+                            is_partial_fill_touch = True
+                            base_price = limit_price
+                        else:
+                            base_price = max(open_p, limit_price)
                     else:
                         # Price did not reach sell limit, defer to next trading day
                         self.pending_orders.append(order)
                         continue
             else:
-                base_price = self._get_execution_price(row)
+                base_price = self._get_execution_price(ticker, current_idx)
+
+            # Apply partial fill logic if it only touched the limit price
+            if is_partial_fill_touch:
+                original_qty = qty
+                qty = int(qty * self.limit_fill_fraction)
+                if effective_lot_size and effective_lot_size > 0:
+                    qty = (qty // effective_lot_size) * effective_lot_size
+                # If quantity rounds to 0, try to fill at least one minimum lot if order size permits
+                if qty == 0 and original_qty >= effective_lot_size:
+                    qty = effective_lot_size
+                qty = min(qty, original_qty)
+
+                touch_note = f"Limit price touched. Conservative policy filled {self.limit_fill_fraction*100:.0f}% of order."
+                if order.note:
+                    order.note = f"{order.note} ({touch_note})"
+                else:
+                    order.note = touch_note
 
             # Apply Price Limits (Ceiling/Floor)
             ceiling, floor, is_ceiling, is_floor = self._check_price_limits(
@@ -1621,12 +1126,22 @@ class BacktestEngine:
                 continue
 
             if action == "sell" and is_floor and self.restrict_floor_sell:
+                # [FORCE SELL SAFETY] check if this order is a Margin liquidation
+                is_force_sell = order.note and "Force Sell" in order.note
+                reason_msg = f"Price at Floor limit ({floor})"
+                if is_force_sell:
+                    reason_msg += " - WARNING: Force Sell Liquidation failed due to liquidity shortage (floor lock)!"
+                    logger.warning(
+                        f"[MARGIN CALL] Giải chấp thất bại đối với {ticker}: "
+                        f"Cổ phiếu bị floor lock (mất thanh khoản bán) tại ngày {current_time.strftime('%d/%m/%Y')}."
+                    )
+
                 self.order_logs.append(
                     {
                         "Date": current_time,
                         "Ticker": ticker,
                         "Action": "SELL_REJECTED",
-                        "Reason": f"Price at Floor limit ({floor})",
+                        "Reason": reason_msg,
                         "Price": base_price,
                         "Quantity": 0,
                     }
@@ -1649,10 +1164,9 @@ class BacktestEngine:
                 pct_slippage = self.slippage
                 if (
                     self.market_impact_coef > 0.0
-                    and "Volume" in row
-                    and row["Volume"] > 0
+                    and vol > 0
                 ):
-                    volume_share = qty / row["Volume"]
+                    volume_share = qty / vol
                     pct_slippage += self.market_impact_coef * (volume_share**2)
 
                 # Cap percentage slippage at 5.0% to keep it realistic
@@ -1696,9 +1210,10 @@ class BacktestEngine:
             # --- PROCESS BUY ORDER ---
             if action == "buy":
                 original_qty = qty
-                # Apply volume limit constraint if specified
-                if self.max_volume_ratio is not None and "Volume" in row:
-                    max_qty = int(row["Volume"] * self.max_volume_ratio)
+                # Apply volume limit constraint (use max_volume_ratio if specified, otherwise fall back to volume_limit_ratio)
+                active_volume_ratio = self.max_volume_ratio if self.max_volume_ratio is not None else self.volume_limit_ratio
+                if active_volume_ratio is not None:
+                    max_qty = int(vol * active_volume_ratio)
                     if effective_lot_size and effective_lot_size > 0:
                         max_qty = (
                             int(max_qty // effective_lot_size) * effective_lot_size
@@ -1906,6 +1421,7 @@ class BacktestEngine:
                     "TotalValue": total_cost,
                     "AdvanceFee": advance_fee,
                     "TimePlaced": time_placed,
+                    "Note": order.note if order.note else None,
                 }
                 self.trades_history.append(trade_record)
 
@@ -1985,7 +1501,7 @@ class BacktestEngine:
                     self.position_highest_price[ticker] = max(
                         self.position_highest_price.get(ticker, 0.0),
                         exec_price,
-                        row["High"],
+                        high_p,
                     )
                 else:
                     self.position_highest_price[ticker] = max(
@@ -2030,9 +1546,10 @@ class BacktestEngine:
                         )
                     continue
 
-                # Apply volume limit constraint if specified
-                if self.max_volume_ratio is not None and "Volume" in row:
-                    max_qty = int(row["Volume"] * self.max_volume_ratio)
+                # Apply volume limit constraint (use max_volume_ratio if specified, otherwise fall back to volume_limit_ratio)
+                active_volume_ratio = self.max_volume_ratio if self.max_volume_ratio is not None else self.volume_limit_ratio
+                if active_volume_ratio is not None:
+                    max_qty = int(vol * active_volume_ratio)
                     if effective_lot_size and effective_lot_size > 0:
                         max_qty = (
                             int(max_qty // effective_lot_size) * effective_lot_size
@@ -2112,6 +1629,7 @@ class BacktestEngine:
                     "Tax": tax,
                     "TotalValue": net_proceeds,
                     "TimePlaced": time_placed,
+                    "Note": order.note if order.note else None,
                 }
                 self.trades_history.append(trade_record)
 
@@ -2208,6 +1726,14 @@ class BacktestEngine:
 
             self.data[ticker] = df_reindexed
 
+        # Pre-group tickers by their normalized last active date for O(1) daily lookup
+        self.tickers_by_last_active_date = {}
+        for ticker, last_active_date in self.last_active_dates.items():
+            norm_date = last_active_date.normalize()
+            if norm_date not in self.tickers_by_last_active_date:
+                self.tickers_by_last_active_date[norm_date] = []
+            self.tickers_by_last_active_date[norm_date].append(ticker)
+
     def _size_pending_orders(self, current_time: pd.Timestamp, current_idx: int):
         """
         Convert float/None sizes and target percent orders into exact share quantities
@@ -2232,11 +1758,9 @@ class BacktestEngine:
                 continue
 
             # Get latest close price of the ticker
-            ticker_df = self.data[ticker]
-            if current_time in ticker_df.index:
-                close_price = ticker_df.loc[current_time, "Close"]
-            else:
-                close_val = self._prev_close_cache[ticker].get(current_time)
+            close_price = self._price_arrays[ticker]["Close"][current_idx]
+            if pd.isna(close_price):
+                close_val = self._prev_close_cache[ticker][current_idx]
                 close_price = None if pd.isna(close_val) else float(close_val)
 
             if close_price is None or pd.isna(close_price) or close_price <= 0:
@@ -2262,11 +1786,9 @@ class BacktestEngine:
             # Calculate total portfolio equity for target percent or margin calculations
             positions_value = 0.0
             for t, pos_qty in self.positions.items():
-                t_df = self.data[t]
-                if current_time in t_df.index:
-                    c_price = t_df.loc[current_time, "Close"]
-                else:
-                    c_val = self._prev_close_cache[t].get(current_time, 0.0) or 0.0
+                c_price = self._price_arrays[t]["Close"][current_idx]
+                if pd.isna(c_price):
+                    c_val = self._prev_close_cache[t][current_idx]
                     c_price = 0.0 if pd.isna(c_val) else float(c_val)
                 positions_value += pos_qty * c_price
             equity = self.cash + positions_value
@@ -2409,18 +1931,19 @@ class BacktestEngine:
             if qty <= 0:
                 continue
 
-            ticker_df = self.data[ticker]
-            if current_time not in ticker_df.index:
+            # Get values at current_idx directly from numpy arrays
+            ticker_arrays = self._price_arrays[ticker]
+            if current_idx >= len(ticker_arrays["Open"]):
                 continue
 
-            row = ticker_df.loc[current_time]
+            traded = ticker_arrays["Traded"][current_idx]
             # Skip checking if not traded today
-            if "Traded" in row and row["Traded"] == 0:
+            if traded == 0:
                 continue
 
-            low_price = row["Low"]
-            high_price = row["High"]
-            open_price = row["Open"]
+            low_price = ticker_arrays["Low"][current_idx]
+            high_price = ticker_arrays["High"][current_idx]
+            open_price = ticker_arrays["Open"][current_idx]
 
             # Get position highest price before today to calculate trailing stop level
             prev_highest = self.position_highest_price.get(ticker, open_price)

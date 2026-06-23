@@ -177,6 +177,7 @@ class Strategy:
         expiration_bars: int = None,
         oco_sibling: Any = None,
         order_type: str = None,
+        note: str = None,
     ) -> Any:
         """
         Place a Buy Order.
@@ -192,6 +193,7 @@ class Strategy:
             expiration_bars (int, optional): Expiration of the order in number of bars.
             oco_sibling (Order, optional): Sibling OCO order.
             order_type (str, optional): Custom order type (e.g. 'ATO', 'ATC').
+            note (str, optional): Custom transaction note or tracking info.
         """
         oco_sibling_id = oco_sibling.order_id if oco_sibling is not None else None
         order = self.engine.place_buy_order(
@@ -203,6 +205,7 @@ class Strategy:
             expiration_bars=expiration_bars,
             oco_sibling_id=oco_sibling_id,
             order_type=order_type,
+            note=note,
         )
         if oco_sibling is not None:
             # Bidirectional linking
@@ -220,6 +223,7 @@ class Strategy:
         expiration_bars: int = None,
         oco_sibling: Any = None,
         order_type: str = None,
+        note: str = None,
     ) -> Any:
         """
         Place a Sell Order.
@@ -235,6 +239,7 @@ class Strategy:
             expiration_bars (int, optional): Expiration of the order in number of bars.
             oco_sibling (Order, optional): Sibling OCO order.
             order_type (str, optional): Custom order type (e.g. 'ATO', 'ATC').
+            note (str, optional): Custom transaction note or tracking info.
         """
         oco_sibling_id = oco_sibling.order_id if oco_sibling is not None else None
         order = self.engine.place_sell_order(
@@ -246,6 +251,7 @@ class Strategy:
             expiration_bars=expiration_bars,
             oco_sibling_id=oco_sibling_id,
             order_type=order_type,
+            note=note,
         )
         if oco_sibling is not None:
             # Bidirectional linking
@@ -265,6 +271,37 @@ class Strategy:
         return self.engine.place_target_percent_order(
             ticker, target_percent, time=self.current_time
         )
+
+    def rebalance(self, target_weights: dict[str, float]):
+        """
+        Tự động tái cân bằng danh mục theo tỷ trọng mục tiêu.
+
+        Args:
+            target_weights (dict): Dict ánh xạ mã CP -> tỷ trọng (ví dụ: {'FPT': 0.4, 'HPG': 0.6}).
+                                  Các mã có vị thế hiện tại nhưng không có trong dict sẽ bị bán hết (tỷ trọng = 0.0).
+        """
+        total_weight = sum(target_weights.values())
+        margin_ratio = getattr(self.engine, "margin_ratio", 1.0)
+        max_leverage = 1.0 / margin_ratio if margin_ratio > 0 else 1.0
+
+        if total_weight > max_leverage:
+            import warnings
+            warnings.warn(
+                f"Tổng tỷ trọng tái cân bằng ({total_weight:.2f}) vượt quá mức ký quỹ tối đa ({max_leverage:.2f}). "
+                f"Tự động tỷ lệ thu nhỏ để khớp với sức mua tối đa.",
+                UserWarning
+            )
+            factor = max_leverage / total_weight
+            target_weights = {ticker: w * factor for ticker, w in target_weights.items()}
+
+        # Bán các cổ phiếu không có trong danh sách tái cân bằng bằng cách đặt target_percent = 0.0
+        for ticker in list(self.positions.keys()):
+            if ticker not in target_weights:
+                self.order_target_percent(ticker, 0.0)
+
+        # Đặt các lệnh tái cân bằng tỷ trọng mục tiêu
+        for ticker, weight in target_weights.items():
+            self.order_target_percent(ticker, weight)
 
     def I(
         self, func: Callable[..., pd.Series], *args, ticker: str = None, **kwargs
@@ -310,6 +347,11 @@ class Strategy:
 
         df = self.data[ticker] if ticker and isinstance(self.data, dict) else self.data
 
+        # Pop standard metadata/plotting arguments that are not meant for the indicator calculation function
+        name = kwargs.pop("name", None)
+        plot = kwargs.pop("plot", None)
+        overlay = kwargs.pop("overlay", None)
+
         # Redirect indicators from Close to Adj_Close if adjusted price columns are available
         if "Adj_Close" in df.columns and "column" not in kwargs:
             try:
@@ -342,20 +384,45 @@ class Strategy:
                 f"nhưng đã trả về {type(indicator_series).__name__}."
             )
 
-        # Check for Look-Ahead Bias by running the indicator on sliced historical data
-        import numpy as np
-        import warnings
+        check_lookahead = getattr(self.engine, "check_lookahead", True)
+        if check_lookahead and len(df) > 5:
+            import numpy as np
+            import warnings
 
-        if len(df) > 5:
-            test_indices = [len(df) // 2, len(df) - 2]
+            # Estimate warmup period from function arguments or keyword args to avoid false positives
+            warmup = 30  # default warmup period
+            for val in list(kwargs.values()) + list(func_args):
+                if isinstance(val, int) and 0 < val < 500:
+                    warmup = max(warmup, val)
+
+            # Select test indices that are past the warmup phase (e.g. 2 * warmup)
+            test_indices = []
+            mid_idx = len(df) // 2
+            if mid_idx > 2 * warmup:
+                test_indices.append(mid_idx)
+            end_idx = len(df) - 2
+            if end_idx > 2 * warmup and end_idx not in test_indices:
+                test_indices.append(end_idx)
+
+            # Fallback to len(df) - 2 if warmup is large relative to the data length
+            if not test_indices and len(df) > warmup + 2:
+                test_indices.append(len(df) - 2)
+
             for idx_test in test_indices:
+                test_date = df.index[idx_test]
                 df_sliced = df.iloc[: idx_test + 1]
                 try:
                     # Run the indicator function on the sliced data
                     sliced_series = func(df_sliced, *func_args, **kwargs)
                     if isinstance(sliced_series, pd.Series) and len(sliced_series) > 0:
-                        val_sliced = sliced_series.iloc[-1]
-                        val_full = indicator_series.iloc[idx_test]
+                        # Use label-based indexing to align values, avoiding position shifts from dropna()
+                        if isinstance(sliced_series.index, pd.DatetimeIndex):
+                            val_sliced = sliced_series.loc[test_date] if test_date in sliced_series.index else np.nan
+                            val_full = indicator_series.loc[test_date] if test_date in indicator_series.index else np.nan
+                        else:
+                            # Fallback to integer labels if RangeIndex is used
+                            val_sliced = sliced_series.loc[idx_test] if idx_test in sliced_series.index else np.nan
+                            val_full = indicator_series.loc[idx_test] if idx_test in indicator_series.index else np.nan
 
                         is_bias = False
                         if pd.isna(val_sliced) != pd.isna(val_full):

@@ -17,9 +17,10 @@ class PerformanceAnalyzer:
         initial_cash: float = 100_000_000.0,
         risk_free_rate: float = 0.04,  # 4% risk-free rate typical in VN
         include_auto_close: bool = True,
+        stock_data: Dict[str, pd.DataFrame] = None,
     ) -> Dict[str, Any]:
         """
-        Calculate metrics.
+        Calculate metrics including MAE and MFE if stock_data is provided.
 
         Args:
             equity_curve (pd.DataFrame): DataFrame with index 'Date' and column 'Equity'.
@@ -27,6 +28,8 @@ class PerformanceAnalyzer:
             benchmark_data (pd.DataFrame, optional): DataFrame with index 'Date' and column 'Close' (benchmark).
             initial_cash (float): Starting portfolio value.
             risk_free_rate (float): Annualized risk-free rate.
+            include_auto_close (bool): Whether to include auto-closed trades.
+            stock_data (Dict, optional): Dictionary of DataFrames of price history for MAE/MFE calculation.
 
         Returns:
             Dict: Financial metrics.
@@ -89,6 +92,14 @@ class PerformanceAnalyzer:
             int(drawdown_streaks.max()) if not drawdown_streaks.empty else 0
         )
 
+        # Calmar Ratio & Recovery Factor
+        if max_drawdown < 0:
+            calmar_ratio = cagr / abs(max_drawdown)
+            recovery_factor = total_return / abs(max_drawdown)
+        else:
+            calmar_ratio = None
+            recovery_factor = None
+
         # Trade Statistics
         # Filter out auto-closed trades from trade-level stats to avoid skewing win rate/profit factor if requested
         strategy_trades = trades
@@ -114,6 +125,9 @@ class PerformanceAnalyzer:
         best_trade = 0.0
         worst_trade = 0.0
         avg_hold_days = 0.0
+        expectancy = 0.0
+        avg_mae = 0.0
+        avg_mfe = 0.0
 
         if total_orders > 0:
             # Filter for trade matching (BUY, SELL, DIVIDEND_STOCK, and DIVIDEND_CASH)
@@ -163,6 +177,8 @@ class PerformanceAnalyzer:
                         for lot in buy_queues[ticker]:
                             lot["qty"] *= 1.0 + ratio
                             lot["price"] /= 1.0 + ratio
+                            if "realized_dividend_per_share" in lot:
+                                lot["realized_dividend_per_share"] /= 1.0 + ratio
                     else:
                         # Fallback for anomaly cases
                         import logging
@@ -178,6 +194,7 @@ class PerformanceAnalyzer:
                                 "price": 0.0,
                                 "date": t["Date"],
                                 "fee": 0.0,
+                                "realized_dividend_per_share": 0.0,
                             }
                         )
                 elif t["Action"] == "DIVIDEND_CASH":
@@ -187,8 +204,8 @@ class PerformanceAnalyzer:
                     if total_qty > 0:
                         d = net_amount / total_qty
                         for lot in buy_queues[ticker]:
-                            # Reduce cost basis of active lots by the net dividend per share
-                            lot["price"] -= d
+                            # Track cash dividend per share on the lot instead of subtracting from lot["price"]
+                            lot["realized_dividend_per_share"] = lot.get("realized_dividend_per_share", 0.0) + d
                     else:
                         # Find recently completed trades for this ticker
                         ticker_completed = [
@@ -210,24 +227,50 @@ class PerformanceAnalyzer:
 
                     realized_gain = 0.0
                     total_buy_cost = 0.0
+                    total_dividend_sum = 0.0
                     days_held_sum = 0.0
                     matched_qty_sum = 0
+                    mae_weighted_sum = 0.0
+                    mfe_weighted_sum = 0.0
+                    has_mae_mfe = False
 
                     buy_queue = buy_queues[ticker]
                     while sell_qty > 1e-5 and buy_queue:
                         buy_lot = buy_queue[0]
                         matched_qty = min(sell_qty, buy_lot["qty"])
 
-                        # Calculate proportional buy cost
+                        # Calculate proportional buy cost and dividends
                         prop_buy_cost = matched_qty * buy_lot["price"]
                         prop_buy_fee = buy_lot["fee"] * (matched_qty / buy_lot["qty"])
+                        prop_dividend = matched_qty * buy_lot.get("realized_dividend_per_share", 0.0)
 
                         total_buy_cost += prop_buy_cost + prop_buy_fee
+                        total_dividend_sum += prop_dividend
 
                         # Days held
                         hold_days = (sell_date - buy_lot["date"]).days
                         days_held_sum += hold_days * matched_qty
                         matched_qty_sum += matched_qty
+
+                        # Calculate MAE / MFE for this lot if stock_data is available
+                        if stock_data is not None and ticker in stock_data:
+                            buy_date = buy_lot["date"]
+                            b_date = buy_date.tz_localize(None) if buy_date.tz is not None else buy_date
+                            s_date = sell_date.tz_localize(None) if sell_date.tz is not None else sell_date
+                            ticker_df = stock_data[ticker]
+                            if ticker_df.index.tz is not None:
+                                ticker_df = ticker_df.copy()
+                                ticker_df.index = ticker_df.index.tz_localize(None)
+                            
+                            df_slice = ticker_df.loc[b_date:s_date]
+                            if not df_slice.empty:
+                                max_high = float(df_slice["High"].max())
+                                min_low = float(df_slice["Low"].min())
+                                lot_mae = (min_low - buy_lot["price"]) / buy_lot["price"]
+                                lot_mfe = (max_high - buy_lot["price"]) / buy_lot["price"]
+                                mae_weighted_sum += lot_mae * matched_qty
+                                mfe_weighted_sum += lot_mfe * matched_qty
+                                has_mae_mfe = True
 
                         # Deduct from buy queue and update remaining fee
                         buy_lot["fee"] -= prop_buy_fee
@@ -243,11 +286,14 @@ class PerformanceAnalyzer:
                         prop_sell_tax = sell_tax * (matched_qty_sum / t["Quantity"])
                         net_proceeds = prop_sell_val - prop_sell_fee - prop_sell_tax
 
-                        trade_profit = net_proceeds - total_buy_cost
+                        # Add dividend sum directly to trade profit
+                        trade_profit = net_proceeds - total_buy_cost + total_dividend_sum
                         trade_return = (
                             trade_profit / total_buy_cost if total_buy_cost > 0 else 0.0
                         )
                         avg_hold = days_held_sum / matched_qty_sum
+                        trade_mae = mae_weighted_sum / matched_qty_sum if has_mae_mfe else None
+                        trade_mfe = mfe_weighted_sum / matched_qty_sum if has_mae_mfe else None
 
                         completed_trades.append(
                             {
@@ -256,6 +302,8 @@ class PerformanceAnalyzer:
                                 "return": trade_return,
                                 "hold_days": avg_hold,
                                 "buy_cost": total_buy_cost,
+                                "mae": trade_mae,
+                                "mfe": trade_mfe,
                             }
                         )
 
@@ -287,12 +335,26 @@ class PerformanceAnalyzer:
                 worst_trade = np.min(trade_returns)
                 avg_hold_days = np.mean([tc["hold_days"] for tc in completed_trades])
 
+                # Expectancy calculation
+                win_returns = [tc["return"] for tc in completed_trades if tc["profit"] > 0]
+                loss_returns = [tc["return"] for tc in completed_trades if tc["profit"] <= 0]
+                avg_win = np.mean(win_returns) if win_returns else 0.0
+                avg_loss = np.mean(loss_returns) if loss_returns else 0.0
+                expectancy = (win_rate * avg_win) + ((1.0 - win_rate) * avg_loss)
+
+                # MAE / MFE portfolio average
+                maes = [tc["mae"] for tc in completed_trades if tc.get("mae") is not None]
+                mfes = [tc["mfe"] for tc in completed_trades if tc.get("mfe") is not None]
+                avg_mae = np.mean(maes) if maes else 0.0
+                avg_mfe = np.mean(mfes) if mfes else 0.0
+
         # Benchmark Metrics
         benchmark_return = 0.0
         benchmark_cagr = 0.0
         alpha = 0.0
         beta = 1.0
         outperformance = 0.0
+        information_ratio = None
 
         primary_bench_data = None
         if isinstance(benchmark_data, dict):
@@ -375,6 +437,16 @@ class PerformanceAnalyzer:
                 beta = 1.0
                 alpha = 0.0
 
+            # Calculate Tracking Error and Information Ratio
+            daily_active_return = aligned_data["Strategy_Return"] - aligned_data["Benchmark_Return"]
+            daily_active_vol = daily_active_return.std()
+            tracking_error = daily_active_vol * np.sqrt(252)
+            active_return = cagr - benchmark_cagr
+            if tracking_error > 0:
+                information_ratio = active_return / tracking_error
+            else:
+                information_ratio = 0.0
+
         return {
             "duration_days": duration_days,
             "years": round(years, 2),
@@ -387,6 +459,8 @@ class PerformanceAnalyzer:
             "sortino_ratio": sortino_ratio,
             "max_drawdown": max_drawdown,
             "max_drawdown_duration": max_dd_duration,
+            "calmar_ratio": calmar_ratio,
+            "recovery_factor": recovery_factor,
             "total_trades": total_trades,  # Số round-trips hoàn chỉnh (BUY→SELL)
             "total_orders": total_orders,  # Tổng số lệnh BUY + SELL (raw order count)
             "win_rate": win_rate,
@@ -395,11 +469,15 @@ class PerformanceAnalyzer:
             "best_trade": best_trade,
             "worst_trade": worst_trade,
             "avg_hold_days": round(avg_hold_days, 1),
+            "expectancy": expectancy,
             "benchmark_return": benchmark_return,
             "benchmark_cagr": benchmark_cagr,
             "outperformance": outperformance,
             "alpha": alpha,
             "beta": beta,
+            "information_ratio": information_ratio,
             "risk_free_rate": risk_free_rate,
+            "avg_mae": avg_mae,
+            "avg_mfe": avg_mfe,
             "completed_trades": completed_trades,
         }

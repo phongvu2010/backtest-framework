@@ -327,8 +327,27 @@ class ReportGenerator:
         pos_cols = [col for col in equity_df.columns if col.startswith("Val_")]
         total_equity = equity_df["Equity"]
 
-        # Cash allocation
-        cash_pct = (equity_df["Cash"] / total_equity) * 100
+        # Split Cash and Margin Debt
+        cash_only = equity_df["Cash"].clip(lower=0)
+        margin_debt = equity_df["Cash"].clip(upper=0)
+
+        cash_pct = (cash_only / total_equity) * 100
+        margin_pct = (margin_debt / total_equity) * 100
+
+        # Draw Margin Debt (negative, stackgroup="two")
+        fig_alloc.add_trace(
+            go.Scatter(
+                x=equity_df.index,
+                y=margin_pct,
+                name="NỢ MARGIN (Margin Debt)",
+                stackgroup="two",
+                mode="lines",
+                line=dict(width=0.5, color="#ef4444"),
+                fillcolor="rgba(239, 68, 68, 0.2)",
+            )
+        )
+
+        # Draw Cash (positive, stackgroup="one")
         fig_alloc.add_trace(
             go.Scatter(
                 x=equity_df.index,
@@ -336,8 +355,8 @@ class ReportGenerator:
                 name="TIỀN MẶT (Cash)",
                 stackgroup="one",
                 mode="lines",
-                line=dict(width=0.5),
-                fillcolor="rgba(156, 163, 175, 0.35)",
+                line=dict(width=0.5, color="#9ca3af"),
+                fillcolor="rgba(156, 163, 175, 0.25)",
             )
         )
 
@@ -365,7 +384,7 @@ class ReportGenerator:
             legend=dict(x=0.01, y=0.99, bgcolor="rgba(15, 23, 42, 0.8)"),
             margin=dict(l=20, r=20, t=50, b=20),
             height=320,
-            yaxis=dict(range=[0, 100]),
+            yaxis=dict(ticksuffix="%"),
         )
         fig_alloc.update_xaxes(showgrid=True, gridcolor="rgba(255,255,255,0.05)")
         fig_alloc.update_yaxes(showgrid=True, gridcolor="rgba(255,255,255,0.05)")
@@ -501,10 +520,15 @@ class ReportGenerator:
             "cagr",
             "sharpe_ratio",
             "sortino_ratio",
+            "calmar_ratio",
+            "recovery_factor",
+            "information_ratio",
+            "expectancy",
             "max_drawdown",
             "win_rate",
             "profit_factor",
             "total_trades",
+            "is_bankrupt",
         }
         param_cols = [col for col in results_df.columns if col not in metric_cols]
 
